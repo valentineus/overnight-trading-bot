@@ -1,0 +1,15 @@
+.DS_Store
+
+# Go build artifacts
+/bin/
+/dist/
+*.test
+*.out
+
+# Local configuration and secrets
+.env
+config.yaml
+
+# Editor folders
+.idea/
+.vscode/
