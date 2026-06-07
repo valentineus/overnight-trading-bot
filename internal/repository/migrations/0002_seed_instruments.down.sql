@@ -1,0 +1,7 @@
+DELETE FROM instruments WHERE instrument_uid IN (
+  'PENDING:TRUR','PENDING:TGLD','PENDING:TBRU','PENDING:TDIV','PENDING:TMON',
+  'PENDING:TOFZ','PENDING:TLCB','PENDING:TITR','PENDING:TRND','PENDING:TMOS'
+);
+
+UPDATE schema_meta SET meta_value='0001' WHERE meta_key='schema_version';
+

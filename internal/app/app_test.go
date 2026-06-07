@@ -3,49 +3,29 @@ package app
 import (
 	"bytes"
 	"context"
-	"os"
 	"strings"
 	"testing"
 )
 
-func TestRunRequiresConfigPath(t *testing.T) {
-	err := Run(context.Background(), Options{})
+func TestRunRequiresAppMode(t *testing.T) {
+	t.Setenv("APP_MODE", "")
+	err := Run(context.Background(), Options{RunOnce: true})
 	if err == nil {
 		t.Fatal("expected error")
 	}
-
-	if !strings.Contains(err.Error(), "config path is required") {
+	if !strings.Contains(err.Error(), "APP_MODE") && !strings.Contains(err.Error(), "MODE") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestRunReportsMissingConfig(t *testing.T) {
-	err := Run(context.Background(), Options{ConfigPath: "missing.yaml"})
-	if err == nil {
-		t.Fatal("expected error")
-	}
-
-	if !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestRunUsesExistingConfig(t *testing.T) {
-	touch := t.TempDir() + "/config.yaml"
-	if err := os.WriteFile(touch, []byte("instruments: []\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
+func TestRunBacktestModeWithoutDB(t *testing.T) {
+	t.Setenv("APP_MODE", "backtest")
 	var stdout bytes.Buffer
-	err := Run(context.Background(), Options{
-		ConfigPath: touch,
-		Stdout:     &stdout,
-	})
+	err := Run(context.Background(), Options{Stdout: &stdout, RunOnce: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if !strings.Contains(stdout.String(), "initialized") {
-		t.Fatalf("unexpected stdout: %q", stdout.String())
+	if !strings.Contains(stdout.String(), "backtest") {
+		t.Fatalf("unexpected stdout: %s", stdout.String())
 	}
 }

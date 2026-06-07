@@ -1,0 +1,189 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    name: Test, build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      RELEASE_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Print Go version
+        run: go version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Install golangci-lint
+        run: |
+          set -Eeuo pipefail
+          bin_dir="$(go env GOPATH)/bin"
+          install -d "$bin_dir"
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$bin_dir" latest
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Lint
+        run: golangci-lint run ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build linux/amd64 binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -Eeuo pipefail
+          mkdir -p out/release/bin out/release/systemd
+          go build -trimpath -ldflags="-s -w" -o out/release/bin/overnight-trading-bot ./cmd/bot
+          go build -trimpath -ldflags="-s -w" -o out/release/bin/overnight-trading-bot-migrate ./cmd/migrate
+          go build -trimpath -ldflags="-s -w" -o out/release/bin/overnight-trading-bot-backtest ./cmd/backtest
+          cp deploy/systemd/overnight-trading-bot.service out/release/systemd/
+          file out/release/bin/overnight-trading-bot
+
+      - name: Pack release archive
+        run: |
+          set -Eeuo pipefail
+          tar -C out/release -czf out/release.tar.gz .
+
+      - name: Validate inputs and configure SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY_BASE64: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "${DEPLOY_HOST:-}" ]; then
+            echo "secrets.DEPLOY_HOST is required." >&2
+            exit 1
+          fi
+          if [ -z "${DEPLOY_SSH_PRIVATE_KEY_BASE64:-}" ]; then
+            echo "secrets.DEPLOY_SSH_PRIVATE_KEY_BASE64 is required." >&2
+            exit 1
+          fi
+
+          install -m 700 -d ~/.ssh
+          printf '%s' "$DEPLOY_SSH_PRIVATE_KEY_BASE64" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p 22 -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload archive
+        run: |
+          set -Eeuo pipefail
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p 22 \
+            root@"$DEPLOY_HOST" \
+            "install -d -m 0755 /var/tmp/overnight-trading-bot-deploy"
+          scp \
+            -i ~/.ssh/deploy_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -P 22 \
+            out/release.tar.gz \
+            root@"$DEPLOY_HOST":/var/tmp/overnight-trading-bot-deploy/release.tar.gz
+
+      - name: Install release and restart service
+        run: |
+          set -Eeuo pipefail
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p 22 \
+            root@"$DEPLOY_HOST" \
+            "RELEASE_SHA='$RELEASE_SHA' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+
+          for cmd in systemctl tar install useradd journalctl; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              echo "$cmd is not installed on the server." >&2
+              exit 1
+            fi
+          done
+
+          env_file=/etc/overnight-trading-bot/overnight-trading-bot.env
+          if [ ! -f "$env_file" ]; then
+            echo "Missing $env_file. Create it before running deploy (see README)." >&2
+            exit 1
+          fi
+
+          if ! id -u overnight-bot >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir /nonexistent \
+              --shell /usr/sbin/nologin overnight-bot
+          fi
+
+          chgrp overnight-bot "$env_file"
+          chmod 0640 "$env_file"
+
+          stage_dir=/var/tmp/overnight-trading-bot-deploy/stage
+          rm -rf "$stage_dir"
+          install -d -m 0755 "$stage_dir"
+          tar -xzf /var/tmp/overnight-trading-bot-deploy/release.tar.gz -C "$stage_dir"
+          rm -f /var/tmp/overnight-trading-bot-deploy/release.tar.gz
+
+          for bin in overnight-trading-bot overnight-trading-bot-migrate overnight-trading-bot-backtest; do
+            install -m 0755 "$stage_dir/bin/$bin" "/usr/local/bin/$bin.new"
+            mv -f "/usr/local/bin/$bin.new" "/usr/local/bin/$bin"
+          done
+
+          install -m 0644 "$stage_dir/systemd/overnight-trading-bot.service" \
+            /etc/systemd/system/overnight-trading-bot.service
+
+          rm -rf "$stage_dir"
+
+          systemctl daemon-reload
+          systemctl enable overnight-trading-bot.service
+          systemctl restart overnight-trading-bot.service
+
+          for _ in $(seq 1 30); do
+            if systemctl is-active --quiet overnight-trading-bot.service; then
+              break
+            fi
+            sleep 2
+          done
+
+          if ! systemctl is-active --quiet overnight-trading-bot.service; then
+            echo "Service failed to become active after restart." >&2
+            journalctl -u overnight-trading-bot.service -n 100 --no-pager >&2 || true
+            exit 1
+          fi
+
+          for _ in $(seq 1 15); do
+            if /usr/local/bin/overnight-trading-bot -healthcheck >/dev/null 2>&1; then
+              echo "Health endpoint responding."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Health endpoint did not respond after restart." >&2
+          journalctl -u overnight-trading-bot.service -n 100 --no-pager >&2 || true
+          exit 1
+          REMOTE

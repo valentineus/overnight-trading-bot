@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS reconciliations;
+DROP TABLE IF EXISTS daily_reports;
+DROP TABLE IF EXISTS system_state;
+DROP TABLE IF EXISTS free_order_counters;
+DROP TABLE IF EXISTS risk_events;
+DROP TABLE IF EXISTS positions;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS signals;
+DROP TABLE IF EXISTS features;
+DROP TABLE IF EXISTS candles_minute;
+DROP TABLE IF EXISTS candles_daily;
+DROP TABLE IF EXISTS instruments;
+DROP TABLE IF EXISTS schema_meta;

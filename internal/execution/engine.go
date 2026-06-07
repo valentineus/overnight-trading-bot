@@ -1,0 +1,405 @@
+package execution
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/shopspring/decimal"
+
+	"overnight-trading-bot/internal/domain"
+	"overnight-trading-bot/internal/repository"
+)
+
+var ErrBrokerOrdersDisabled = errors.New("broker orders are disabled for current mode")
+var ErrEmptyOrderBook = errors.New("order book has no usable bid/ask")
+
+type Gateway interface {
+	PostLimitOrder(ctx context.Context, accountID, instrumentUID string, side domain.Side, lots int64, price decimal.Decimal, clientOrderID string) (domain.Order, error)
+	CancelOrder(ctx context.Context, accountID, orderID string) error
+	GetOrderState(ctx context.Context, accountID, orderID string) (domain.Order, error)
+}
+
+type Engine struct {
+	mode        domain.Mode
+	accountID   string
+	gateway     Gateway
+	store       repository.Repository
+	maxQuoteAge time.Duration
+	mu          sync.Map
+}
+
+type MonitorConfig struct {
+	Deadline     time.Time
+	PollInterval time.Duration
+	MaxAttempts  int
+	RepostAfter  time.Duration
+	Instrument   domain.Instrument
+	ImproveTicks int
+	Quote        func(ctx context.Context, instrumentUID string) (domain.OrderBook, error)
+}
+
+func NewEngine(mode domain.Mode, accountID string, gateway Gateway, store repository.Repository) Engine {
+	return Engine{mode: mode, accountID: accountID, gateway: gateway, store: store}
+}
+
+func (e *Engine) SetMaxQuoteAge(maxQuoteAge time.Duration) {
+	e.maxQuoteAge = maxQuoteAge
+}
+
+func (e *Engine) PlaceEntry(ctx context.Context, accountIDHash string, instrument domain.Instrument, tradeDate time.Time, lots int64, book domain.OrderBook, improveTicks int, attempt int) (domain.Order, error) {
+	if err := e.checkQuoteFresh(book); err != nil {
+		return domain.Order{}, err
+	}
+	bid, ask, err := bestBidAsk(book)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	price, err := LimitBuyPrice(bid, ask, instrument.MinPriceIncrement, improveTicks)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	return e.PlaceLimit(ctx, domain.Order{
+		ClientOrderID: ClientOrderID(tradeDate, instrument.InstrumentUID, domain.SideBuy, attempt),
+		AccountIDHash: accountIDHash,
+		InstrumentUID: instrument.InstrumentUID,
+		TradeDate:     tradeDate,
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    price,
+		QuantityLots:  lots,
+		Status:        domain.OrderStatusNew,
+		AttemptNo:     attempt,
+		RawStateJSON:  "{}",
+	})
+}
+
+func (e *Engine) PlaceExit(ctx context.Context, accountIDHash string, instrument domain.Instrument, tradeDate time.Time, lots int64, book domain.OrderBook, improveTicks int, attempt int) (domain.Order, error) {
+	if err := e.checkQuoteFresh(book); err != nil {
+		return domain.Order{}, err
+	}
+	bid, ask, err := bestBidAsk(book)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	price, err := LimitSellPrice(bid, ask, instrument.MinPriceIncrement, improveTicks)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	return e.PlaceLimit(ctx, domain.Order{
+		ClientOrderID: ClientOrderID(tradeDate, instrument.InstrumentUID, domain.SideSell, attempt),
+		AccountIDHash: accountIDHash,
+		InstrumentUID: instrument.InstrumentUID,
+		TradeDate:     tradeDate,
+		Side:          domain.SideSell,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    price,
+		QuantityLots:  lots,
+		Status:        domain.OrderStatusNew,
+		AttemptNo:     attempt,
+		RawStateJSON:  "{}",
+	})
+}
+
+func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Order, error) {
+	if e.store != nil {
+		existing, err := e.findExisting(ctx, order)
+		if err != nil {
+			return domain.Order{}, err
+		}
+		if existing.ClientOrderID != "" {
+			return existing, nil
+		}
+	}
+	if !e.mode.AllowsBrokerOrders() {
+		order.Status = domain.OrderStatusNew
+		if e.store != nil {
+			return order, e.store.UpsertOrder(ctx, order)
+		}
+		return order, ErrBrokerOrdersDisabled
+	}
+	if e.gateway == nil {
+		return domain.Order{}, errors.New("gateway is nil")
+	}
+	lock := e.lockFor(order.InstrumentUID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	posted, err := e.gateway.PostLimitOrder(ctx, e.accountID, order.InstrumentUID, order.Side, order.QuantityLots, order.LimitPrice, order.ClientOrderID)
+	if err != nil {
+		order.Status = domain.OrderStatusFailed
+		if e.store != nil {
+			_ = e.store.UpsertOrder(ctx, order)
+		}
+		return domain.Order{}, err
+	}
+	posted.ClientOrderID = order.ClientOrderID
+	posted.AccountIDHash = order.AccountIDHash
+	posted.InstrumentUID = order.InstrumentUID
+	posted.Side = order.Side
+	posted.OrderType = order.OrderType
+	posted.LimitPrice = order.LimitPrice
+	posted.QuantityLots = order.QuantityLots
+	posted.AttemptNo = order.AttemptNo
+	posted.TradeDate = order.TradeDate
+	posted.CreatedAt = time.Now().UTC()
+	posted.UpdatedAt = posted.CreatedAt
+	if e.store != nil {
+		if err := e.store.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
+			if err := repo.UpsertOrder(ctx, posted); err != nil {
+				return fmt.Errorf("persist posted order: %w", err)
+			}
+			return repo.IncrementFreeOrders(ctx, order.TradeDate, order.InstrumentUID, 1)
+		}); err != nil {
+			return domain.Order{}, err
+		}
+	}
+	return posted, nil
+}
+
+func (e *Engine) findExisting(ctx context.Context, order domain.Order) (domain.Order, error) {
+	orders, err := e.store.ListOrders(ctx, order.AccountIDHash, order.TradeDate, order.TradeDate)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	for _, existing := range orders {
+		if existing.ClientOrderID == order.ClientOrderID &&
+			existing.Status != domain.OrderStatusFailed &&
+			existing.Status != domain.OrderStatusRejected {
+			return existing, nil
+		}
+	}
+	return domain.Order{}, nil
+}
+
+func (e *Engine) Refresh(ctx context.Context, order domain.Order) (domain.Order, error) {
+	if e.gateway == nil {
+		return domain.Order{}, errors.New("gateway is nil")
+	}
+	lock := e.lockFor(order.InstrumentUID)
+	lock.Lock()
+	defer lock.Unlock()
+	state, err := e.gateway.GetOrderState(ctx, e.accountID, order.BrokerOrderID)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	state.ClientOrderID = order.ClientOrderID
+	state.AccountIDHash = order.AccountIDHash
+	state.InstrumentUID = order.InstrumentUID
+	state.TradeDate = order.TradeDate
+	state.Side = order.Side
+	state.OrderType = order.OrderType
+	state.LimitPrice = order.LimitPrice
+	state.QuantityLots = order.QuantityLots
+	state.AttemptNo = order.AttemptNo
+	if e.store != nil {
+		if err := e.store.UpsertOrder(ctx, state); err != nil {
+			return domain.Order{}, err
+		}
+	}
+	return state, nil
+}
+
+func (e *Engine) Cancel(ctx context.Context, order domain.Order) error {
+	if e.gateway == nil {
+		return errors.New("gateway is nil")
+	}
+	lock := e.lockFor(order.InstrumentUID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := e.gateway.CancelOrder(ctx, e.accountID, order.BrokerOrderID); err != nil {
+		return err
+	}
+	if e.store != nil {
+		return e.store.UpdateOrderStatus(ctx, order.ClientOrderID, domain.OrderStatusCancelled, order.FilledLots, order.RawStateJSON)
+	}
+	return nil
+}
+
+func (e *Engine) MonitorUntil(ctx context.Context, order domain.Order, cfg MonitorConfig) (domain.Order, error) {
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 500 * time.Millisecond
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = 1
+	}
+	lastPost := time.Now()
+	current := order
+	aggregate := order
+	seen := map[string]domain.Order{order.ClientOrderID: order}
+	ticker := time.NewTicker(cfg.PollInterval)
+	defer ticker.Stop()
+	for {
+		previous := seen[current.ClientOrderID]
+		refreshed, err := e.Refresh(ctx, current)
+		if err != nil {
+			return aggregate, err
+		}
+		aggregate = mergeAggregateFill(aggregate, previous, refreshed)
+		seen[current.ClientOrderID] = refreshed
+		current = mergeOrderState(current, refreshed)
+		aggregate.Status = current.Status
+		aggregate.UpdatedAt = current.UpdatedAt
+		aggregate.RawStateJSON = current.RawStateJSON
+		if aggregate.FilledLots >= aggregate.QuantityLots {
+			aggregate.Status = domain.OrderStatusFilled
+			return aggregate, nil
+		}
+		if isTerminal(current.Status) {
+			return aggregate, nil
+		}
+		if !cfg.Deadline.IsZero() && !time.Now().Before(cfg.Deadline) {
+			if err := e.Cancel(ctx, current); err != nil {
+				return aggregate, err
+			}
+			aggregate.Status = domain.OrderStatusExpired
+			if e.store != nil {
+				if err := e.store.UpdateOrderStatus(ctx, current.ClientOrderID, aggregate.Status, current.FilledLots, current.RawStateJSON); err != nil {
+					return aggregate, err
+				}
+			}
+			return aggregate, nil
+		}
+		shouldRepost := cfg.RepostAfter > 0 &&
+			time.Since(lastPost) >= cfg.RepostAfter &&
+			current.AttemptNo < cfg.MaxAttempts &&
+			aggregate.FilledLots < aggregate.QuantityLots &&
+			cfg.Quote != nil
+		if shouldRepost {
+			next, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+			if err != nil {
+				return aggregate, err
+			}
+			current = next
+			seen[current.ClientOrderID] = current
+			lastPost = time.Now()
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return aggregate, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConfig, remaining int64) (domain.Order, error) {
+	if err := e.Cancel(ctx, order); err != nil {
+		return domain.Order{}, err
+	}
+	if remaining <= 0 {
+		order.Status = domain.OrderStatusFilled
+		return order, nil
+	}
+	book, err := cfg.Quote(ctx, order.InstrumentUID)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	attempt := order.AttemptNo + 1
+	switch order.Side {
+	case domain.SideBuy:
+		return e.PlaceEntry(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
+	case domain.SideSell:
+		return e.PlaceExit(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
+	default:
+		return domain.Order{}, fmt.Errorf("unsupported side %s", order.Side)
+	}
+}
+
+func (e *Engine) checkQuoteFresh(book domain.OrderBook) error {
+	if e.maxQuoteAge <= 0 {
+		return nil
+	}
+	receivedAt := book.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = book.Time
+	}
+	if receivedAt.IsZero() {
+		return fmt.Errorf("quote timestamp is missing")
+	}
+	age := time.Since(receivedAt)
+	if age > e.maxQuoteAge {
+		return fmt.Errorf("quote age %s exceeds %s", age, e.maxQuoteAge)
+	}
+	return nil
+}
+
+func (e *Engine) lockFor(instrumentUID string) *sync.Mutex {
+	value, _ := e.mu.LoadOrStore(instrumentUID, &sync.Mutex{})
+	lock, ok := value.(*sync.Mutex)
+	if !ok {
+		panic("execution lock has unexpected type")
+	}
+	return lock
+}
+
+func bestBidAsk(book domain.OrderBook) (decimal.Decimal, decimal.Decimal, error) {
+	bid, ok := book.BestBid()
+	if !ok {
+		return decimal.Zero, decimal.Zero, ErrEmptyOrderBook
+	}
+	ask, ok := book.BestAsk()
+	if !ok {
+		return decimal.Zero, decimal.Zero, ErrEmptyOrderBook
+	}
+	return bid, ask, nil
+}
+
+func isTerminal(status domain.OrderStatus) bool {
+	switch status {
+	case domain.OrderStatusFilled, domain.OrderStatusCancelled, domain.OrderStatusRejected, domain.OrderStatusExpired, domain.OrderStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func mergeOrderState(base, state domain.Order) domain.Order {
+	base.BrokerOrderID = state.BrokerOrderID
+	base.FilledLots = state.FilledLots
+	base.AvgFillPrice = state.AvgFillPrice
+	base.Status = state.Status
+	base.Commission = state.Commission
+	base.RawStateJSON = state.RawStateJSON
+	base.UpdatedAt = state.UpdatedAt
+	return base
+}
+
+func mergeAggregateFill(aggregate, previous, current domain.Order) domain.Order {
+	deltaLots := current.FilledLots - previous.FilledLots
+	if deltaLots > 0 {
+		deltaAvg := fillDeltaAvg(previous, current, deltaLots)
+		previousValue := aggregate.AvgFillPrice.Mul(decimal.NewFromInt(aggregate.FilledLots))
+		deltaValue := deltaAvg.Mul(decimal.NewFromInt(deltaLots))
+		aggregate.FilledLots += deltaLots
+		aggregate.AvgFillPrice = previousValue.Add(deltaValue).Div(decimal.NewFromInt(aggregate.FilledLots))
+	}
+	deltaCommission := current.Commission.Sub(previous.Commission)
+	if deltaCommission.IsPositive() {
+		aggregate.Commission = aggregate.Commission.Add(deltaCommission)
+	}
+	return aggregate
+}
+
+func fillDeltaAvg(previous, current domain.Order, deltaLots int64) decimal.Decimal {
+	if deltaLots <= 0 {
+		return decimal.Zero
+	}
+	if previous.FilledLots <= 0 {
+		if current.AvgFillPrice.IsPositive() {
+			return current.AvgFillPrice
+		}
+		return current.LimitPrice
+	}
+	currentValue := current.AvgFillPrice.Mul(decimal.NewFromInt(current.FilledLots))
+	previousValue := previous.AvgFillPrice.Mul(decimal.NewFromInt(previous.FilledLots))
+	if currentValue.GreaterThan(previousValue) {
+		return currentValue.Sub(previousValue).Div(decimal.NewFromInt(deltaLots))
+	}
+	if current.AvgFillPrice.IsPositive() {
+		return current.AvgFillPrice
+	}
+	return current.LimitPrice
+}
