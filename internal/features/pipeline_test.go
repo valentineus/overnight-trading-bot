@@ -7,6 +7,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"overnight-trading-bot/internal/domain"
+	"overnight-trading-bot/internal/timeutil"
 )
 
 func TestComputeExpectedCostIncludesCommissionAndSlippage(t *testing.T) {
@@ -54,4 +55,29 @@ func TestIntervalVolume(t *testing.T) {
 	if !got.Equal(decimal.NewFromInt(6040)) {
 		t.Fatalf("interval volume=%s, want 6040", got)
 	}
+}
+
+func TestAverageIntervalVolumeUsesExecutionWindowsAcrossDays(t *testing.T) {
+	loc := time.FixedZone("MSK", 3*60*60)
+	window := timeutil.Window{
+		Start: mustTOD("18:20:00"),
+		End:   mustTOD("18:40:00"),
+	}
+	candles := []domain.Candle{
+		{TradeDate: time.Date(2026, 6, 1, 15, 20, 0, 0, time.UTC), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+		{TradeDate: time.Date(2026, 6, 1, 15, 50, 0, 0, time.UTC), Close: decimal.NewFromInt(999), VolumeLots: decimal.NewFromInt(999)},
+		{TradeDate: time.Date(2026, 6, 2, 15, 25, 0, 0, time.UTC), Close: decimal.NewFromInt(200), VolumeLots: decimal.NewFromInt(10)},
+	}
+	got := AverageIntervalVolume(candles, 1, window, loc)
+	if !got.Equal(decimal.NewFromInt(1500)) {
+		t.Fatalf("average interval volume=%s, want 1500", got)
+	}
+}
+
+func mustTOD(raw string) timeutil.TimeOfDay {
+	tod, err := timeutil.ParseTimeOfDay(raw)
+	if err != nil {
+		panic(err)
+	}
+	return tod
 }

@@ -112,6 +112,7 @@ type RiskConfig struct {
 	MaxClockDriftSec           int             `env:"MAX_CLOCK_DRIFT_SEC" envDefault:"2"`
 	ReconciliationWindowHours  int             `env:"RECONCILIATION_WINDOW_HOURS" envDefault:"72"`
 	ReconciliationSkewSec      int             `env:"RECONCILIATION_SKEW_SEC" envDefault:"10"`
+	CommissionToleranceRUB     decimal.Decimal `env:"COMMISSION_TOLERANCE_RUB" envDefault:"0.01"`
 	CashUsageBuffer            decimal.Decimal `env:"CASH_USAGE_BUFFER" envDefault:"0.95"`
 	RiskBudgetPerInstrumentPct decimal.Decimal `env:"RISK_BUDGET_PER_INSTRUMENT_PCT" envDefault:"0.005"`
 	MinOrderNotionalRUB        decimal.Decimal `env:"MIN_ORDER_NOTIONAL_RUB" envDefault:"1000"`
@@ -198,6 +199,9 @@ func (c *Config) Validate() error {
 	if c.Risk.ReconciliationSkewSec < 0 {
 		return errors.New("RISK_RECONCILIATION_SKEW_SEC must be non-negative")
 	}
+	if c.Risk.CommissionToleranceRUB.IsNegative() {
+		return errors.New("RISK_COMMISSION_TOLERANCE_RUB must be non-negative")
+	}
 	if c.Commission.FreeOrderCountPolicy != "submitted" {
 		return fmt.Errorf("COMM_FREE_ORDER_COUNT_POLICY must be submitted, got %q", c.Commission.FreeOrderCountPolicy)
 	}
@@ -209,6 +213,9 @@ func (c *Config) Validate() error {
 	}
 	if (c.App.Mode == domain.ModeSandbox || c.App.Mode == domain.ModeLiveReadonly || c.App.Mode == domain.ModeLiveTrade) && c.TInvest.Token == "" {
 		return fmt.Errorf("TINVEST_TOKEN is required for APP_MODE=%s", c.App.Mode)
+	}
+	if (c.App.Mode == domain.ModeSandbox || c.App.Mode == domain.ModeLiveReadonly || c.App.Mode == domain.ModeLiveTrade) && c.TInvest.AccountID == "" {
+		return fmt.Errorf("TINVEST_ACCOUNT_ID is required for APP_MODE=%s", c.App.Mode)
 	}
 	if c.TInvest.UseSandbox && c.App.Mode != domain.ModeSandbox {
 		return errors.New("TINVEST_USE_SANDBOX=true is only valid with APP_MODE=sandbox")

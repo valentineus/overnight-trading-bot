@@ -66,6 +66,36 @@ func TestPlaceLimitSuppressesDuplicateSubmit(t *testing.T) {
 	}
 }
 
+func TestPaperPlaceEntryFillsAndCountsSubmittedOrder(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	engine := NewEngine(domain.ModePaper, "account", tinvest.NewFakeGateway(), repo)
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order, err := engine.PlaceEntry(ctx, "hash", domain.Instrument{
+		InstrumentUID:     "uid",
+		Lot:               1,
+		MinPriceIncrement: decimal.NewFromInt(1),
+	}, tradeDate, 2, domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order.Status != domain.OrderStatusFilled || order.FilledLots != 2 || order.BrokerOrderID == "" {
+		t.Fatalf("paper order=%+v, want filled broker-like order", order)
+	}
+	sent, err := repo.GetFreeOrdersSent(ctx, tradeDate, "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 1 {
+		t.Fatalf("free order counter=%d, want 1", sent)
+	}
+}
+
 func TestPlaceEntryRejectsStaleQuote(t *testing.T) {
 	ctx := context.Background()
 	engine := NewEngine(domain.ModeSandbox, "account", tinvest.NewFakeGateway(), testutil.NewMemoryRepository())

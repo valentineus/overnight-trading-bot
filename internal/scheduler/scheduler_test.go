@@ -80,6 +80,9 @@ func TestReconcileAndReportIsIdempotentPerDate(t *testing.T) {
 	gateway := tinvest.NewFakeGateway()
 	notifier := &countNotifier{}
 	recon := reconciliation.New(repo, gateway, "account", "hash")
+	if err := repo.SaveSystemState(ctx, domain.StateMonitorExitOrders, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
 	s := Scheduler{
 		cfg: Config{Mode: domain.ModePaper, Location: time.UTC},
 		sm:  statemachine.New(repo, domain.ModePaper),
@@ -168,6 +171,9 @@ func TestHardDeadlineMarksOpenPositionFailedAndHalts(t *testing.T) {
 	if notifier.alerts != 1 {
 		t.Fatalf("alerts=%d, want 1", notifier.alerts)
 	}
+	if notifier.reports != 1 {
+		t.Fatalf("reports=%d, want daily report before HALT", notifier.reports)
+	}
 }
 
 func TestHoldOvernightCancelsActiveBuyOrders(t *testing.T) {
@@ -195,6 +201,9 @@ func TestHoldOvernightCancelsActiveBuyOrders(t *testing.T) {
 			AccountIDHash: "hash",
 		},
 	}
+	if err := repo.SaveSystemState(ctx, domain.StateMonitorEntryOrders, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.holdOvernight(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +213,47 @@ func TestHoldOvernightCancelsActiveBuyOrders(t *testing.T) {
 	}
 	if len(orders) != 1 || orders[0].Status != domain.OrderStatusCancelled {
 		t.Fatalf("orders=%+v, want CANCELLED", orders)
+	}
+}
+
+func TestNonZeroCommissionQuarantinesInstrumentAndHalts(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	if err := repo.UpsertInstrument(ctx, domain.Instrument{
+		InstrumentUID: "uid",
+		Ticker:        "TRUR",
+		Enabled:       true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &countNotifier{}
+	s := Scheduler{
+		cfg: Config{
+			Mode:                  domain.ModePaper,
+			RequireZeroCommission: true,
+			QuarantineOnNonZero:   true,
+		},
+		svc: Services{
+			Repo:     repo,
+			Risk:     risk.NewManager(repo, risk.ManagerConfig{}),
+			Notifier: notifier,
+		},
+	}
+	if err := s.handleCommission(ctx, "uid", decimal.NewFromFloat(0.01)); err != nil {
+		t.Fatal(err)
+	}
+	if !repo.Halted || repo.State != domain.StateHalted {
+		t.Fatalf("system not halted: state=%s halted=%v", repo.State, repo.Halted)
+	}
+	instruments, err := repo.ListInstruments(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instruments) != 1 || !instruments[0].Quarantine {
+		t.Fatalf("instrument not quarantined: %+v", instruments)
+	}
+	if notifier.alerts != 1 {
+		t.Fatalf("alerts=%d, want 1", notifier.alerts)
 	}
 }
 

@@ -3,6 +3,7 @@ package features
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -11,6 +12,8 @@ import (
 	"overnight-trading-bot/internal/repository"
 	"overnight-trading-bot/internal/timeutil"
 )
+
+const defaultIntervalVolumeLookback = 20
 
 type PipelineConfig struct {
 	RollingShort           int
@@ -22,6 +25,7 @@ type PipelineConfig struct {
 	CommissionRoundtripBps decimal.Decimal
 	EntryWindow            timeutil.Window
 	ExitWindow             timeutil.Window
+	IntervalVolumeLookback int
 	Location               *time.Location
 }
 
@@ -44,7 +48,7 @@ func (p Pipeline) Recompute(ctx context.Context, instrument domain.Instrument, t
 	if err != nil {
 		return domain.FeatureSet{}, err
 	}
-	exitVolume, err := p.intervalVolume(ctx, instrument, tradeDate.AddDate(0, 0, 1), p.cfg.ExitWindow)
+	exitVolume, err := p.intervalVolume(ctx, instrument, tradeDate, p.cfg.ExitWindow)
 	if err != nil {
 		return domain.FeatureSet{}, err
 	}
@@ -66,13 +70,17 @@ func (p Pipeline) intervalVolume(ctx context.Context, instrument domain.Instrume
 	if loc == nil {
 		loc = time.UTC
 	}
-	from := window.Start.On(date, loc).UTC()
+	lookback := p.cfg.IntervalVolumeLookback
+	if lookback <= 0 {
+		lookback = defaultIntervalVolumeLookback
+	}
+	from := window.Start.On(date.AddDate(0, 0, -lookback), loc).UTC()
 	to := window.End.On(date, loc).UTC()
 	candles, err := p.repo.ListMinuteCandles(ctx, instrument.InstrumentUID, from, to)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	return IntervalVolume(candles, instrument.Lot), nil
+	return AverageIntervalVolume(candles, instrument.Lot, window, loc), nil
 }
 
 func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate time.Time, spread SpreadResult, cfg PipelineConfig, entryVolume, exitVolume decimal.Decimal) (domain.FeatureSet, error) {
@@ -145,4 +153,38 @@ func IntervalVolume(candles []domain.Candle, lot int64) decimal.Decimal {
 		total = total.Add(candle.VolumeLots.Mul(decimal.NewFromInt(lot)).Mul(candle.Close))
 	}
 	return total
+}
+
+func AverageIntervalVolume(candles []domain.Candle, lot int64, window timeutil.Window, loc *time.Location) decimal.Decimal {
+	if lot <= 0 || len(candles) == 0 {
+		return decimal.Zero
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	byDate := make(map[string][]domain.Candle)
+	for _, candle := range candles {
+		local := candle.TradeDate.In(loc)
+		tod := time.Duration(local.Hour())*time.Hour +
+			time.Duration(local.Minute())*time.Minute +
+			time.Duration(local.Second())*time.Second
+		if tod < window.Start.Duration || tod > window.End.Duration {
+			continue
+		}
+		key := local.Format("2006-01-02")
+		byDate[key] = append(byDate[key], candle)
+	}
+	if len(byDate) == 0 {
+		return decimal.Zero
+	}
+	keys := make([]string, 0, len(byDate))
+	for key := range byDate {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	sum := decimal.Zero
+	for _, key := range keys {
+		sum = sum.Add(IntervalVolume(byDate[key], lot))
+	}
+	return sum.Div(decimal.NewFromInt(int64(len(keys))))
 }

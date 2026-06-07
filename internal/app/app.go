@@ -114,8 +114,9 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		accountIDHash := accountHash(cfg.TInvest.AccountID)
 		recon := reconciliation.New(repo, gateway, cfg.TInvest.AccountID, accountIDHash).
-			WithWindow(time.Duration(cfg.Risk.ReconciliationWindowHours) * time.Hour).
-			WithInFlightGrace(time.Duration(cfg.Risk.ReconciliationSkewSec) * time.Second)
+			WithWindow(time.Duration(cfg.Risk.ReconciliationWindowHours)*time.Hour).
+			WithInFlightGrace(time.Duration(cfg.Risk.ReconciliationSkewSec)*time.Second).
+			WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB)
 		diffs, err := recon.Run(ctx)
 		if err != nil {
 			return fmt.Errorf("pre-unhalt reconciliation: %w", err)
@@ -155,8 +156,9 @@ func Run(ctx context.Context, opts Options) error {
 
 	accountIDHash := accountHash(cfg.TInvest.AccountID)
 	recon := reconciliation.New(repo, gateway, cfg.TInvest.AccountID, accountIDHash).
-		WithWindow(time.Duration(cfg.Risk.ReconciliationWindowHours) * time.Hour).
-		WithInFlightGrace(time.Duration(cfg.Risk.ReconciliationSkewSec) * time.Second)
+		WithWindow(time.Duration(cfg.Risk.ReconciliationWindowHours)*time.Hour).
+		WithInFlightGrace(time.Duration(cfg.Risk.ReconciliationSkewSec)*time.Second).
+		WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB)
 	sm := statemachine.New(repo, cfg.App.Mode)
 	if _, err := sm.Recover(ctx, recon); err != nil {
 		log.Warn("state recovery did not resume trading", "err", err)
@@ -201,7 +203,8 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 			Start: cfg.Execution.ExitWindowStart,
 			End:   cfg.Execution.ExitWindowEnd,
 		},
-		Location: cfg.Location,
+		IntervalVolumeLookback: 20,
+		Location:               cfg.Location,
 	})
 	signalEngine := signalengine.New(signalengine.Config{
 		MinTStat60:              cfg.Strategy.MinTStat60,
@@ -255,27 +258,30 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 		Log:           log,
 	}
 	return scheduler.New(clock, sm, scheduler.Config{
-		Mode:                  cfg.App.Mode,
-		Location:              cfg.Location,
-		RollingLong:           cfg.Strategy.RollingLong,
-		TickInterval:          30 * time.Second,
-		EntrySignalTime:       cfg.Execution.EntrySignalTime,
-		EntryWindowStart:      cfg.Execution.EntryWindowStart,
-		EntryWindowEnd:        cfg.Execution.EntryWindowEnd,
-		NoNewEntryAfter:       cfg.Execution.NoNewEntryAfter,
-		ExitWatchStart:        cfg.Execution.ExitWatchStart,
-		ExitWindowStart:       cfg.Execution.ExitWindowStart,
-		ExitWindowEnd:         cfg.Execution.ExitWindowEnd,
-		HardExitDeadline:      cfg.Execution.HardExitDeadline,
-		QuoteDepth:            cfg.Execution.QuoteDepth,
-		MaxQuoteAge:           time.Duration(cfg.Execution.MaxQuoteAgeSec) * time.Second,
-		OrderPollInterval:     time.Duration(cfg.Execution.OrderPollIntervalMS) * time.Millisecond,
-		PassiveImproveTicks:   cfg.Execution.PassiveImproveTicks,
-		MaxEntryOrderAttempts: cfg.Execution.MaxEntryOrderAttempts,
-		MaxExitOrderAttempts:  cfg.Execution.MaxExitOrderAttempts,
-		MinTimeToClose:        time.Duration(cfg.Execution.MinTimeToCloseSec) * time.Second,
-		MaxClockDrift:         time.Duration(cfg.Risk.MaxClockDriftSec) * time.Second,
-		APIOutageHalt:         time.Duration(cfg.Risk.APIOutageHaltSec) * time.Second,
+		Mode:                   cfg.App.Mode,
+		Location:               cfg.Location,
+		RollingLong:            cfg.Strategy.RollingLong,
+		TickInterval:           30 * time.Second,
+		EntrySignalTime:        cfg.Execution.EntrySignalTime,
+		EntryWindowStart:       cfg.Execution.EntryWindowStart,
+		EntryWindowEnd:         cfg.Execution.EntryWindowEnd,
+		NoNewEntryAfter:        cfg.Execution.NoNewEntryAfter,
+		ExitWatchStart:         cfg.Execution.ExitWatchStart,
+		ExitWindowStart:        cfg.Execution.ExitWindowStart,
+		ExitWindowEnd:          cfg.Execution.ExitWindowEnd,
+		HardExitDeadline:       cfg.Execution.HardExitDeadline,
+		QuoteDepth:             cfg.Execution.QuoteDepth,
+		MaxQuoteAge:            time.Duration(cfg.Execution.MaxQuoteAgeSec) * time.Second,
+		OrderPollInterval:      time.Duration(cfg.Execution.OrderPollIntervalMS) * time.Millisecond,
+		PassiveImproveTicks:    cfg.Execution.PassiveImproveTicks,
+		MaxEntryOrderAttempts:  cfg.Execution.MaxEntryOrderAttempts,
+		MaxExitOrderAttempts:   cfg.Execution.MaxExitOrderAttempts,
+		MinTimeToClose:         time.Duration(cfg.Execution.MinTimeToCloseSec) * time.Second,
+		MaxClockDrift:          time.Duration(cfg.Risk.MaxClockDriftSec) * time.Second,
+		APIOutageHalt:          time.Duration(cfg.Risk.APIOutageHaltSec) * time.Second,
+		RequireZeroCommission:  cfg.Commission.RequireZeroCommission,
+		QuarantineOnNonZero:    cfg.Commission.QuarantineOnNonZero,
+		ReconciliationInterval: 5 * time.Minute,
 	}, services)
 }
 

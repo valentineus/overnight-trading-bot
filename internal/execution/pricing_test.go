@@ -40,10 +40,14 @@ func TestLimitPricesDoNotCross(t *testing.T) {
 
 func TestClientOrderIDDeterministic(t *testing.T) {
 	date := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
-	a := ClientOrderID(date, "uid", domain.SideBuy, 1)
-	b := ClientOrderID(date, "uid", domain.SideBuy, 1)
-	c := ClientOrderID(date, "uid", domain.SideBuy, 2)
+	longUID := "a-realistic-instrument-uid-that-is-much-longer-than-the-order-id-limit"
+	a := ClientOrderID(date, longUID, domain.SideBuy, 1)
+	b := ClientOrderID(date, longUID, domain.SideBuy, 1)
+	c := ClientOrderID(date, longUID, domain.SideBuy, 2)
 	if a != b || a == c {
 		t.Fatalf("unexpected ids: %s %s %s", a, b, c)
+	}
+	if len(a) > maxClientOrderIDLen {
+		t.Fatalf("client order id len=%d, want <=%d: %s", len(a), maxClientOrderIDLen, a)
 	}
 }

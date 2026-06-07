@@ -11,6 +11,7 @@ import (
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/repository"
+	"overnight-trading-bot/internal/risk"
 )
 
 var ErrBrokerOrdersDisabled = errors.New("broker orders are disabled for current mode")
@@ -113,6 +114,9 @@ func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Ord
 			return existing, nil
 		}
 	}
+	if e.mode == domain.ModePaper {
+		return e.placePaperLimit(ctx, order)
+	}
 	if !e.mode.AllowsBrokerOrders() {
 		order.Status = domain.OrderStatusNew
 		if e.store != nil {
@@ -157,6 +161,28 @@ func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Ord
 		}
 	}
 	return posted, nil
+}
+
+func (e *Engine) placePaperLimit(ctx context.Context, order domain.Order) (domain.Order, error) {
+	now := time.Now().UTC()
+	order.BrokerOrderID = "paper-" + order.ClientOrderID
+	order.FilledLots = order.QuantityLots
+	order.AvgFillPrice = order.LimitPrice
+	order.Status = domain.OrderStatusFilled
+	order.RawStateJSON = `{"paper_fill":true}`
+	order.CreatedAt = now
+	order.UpdatedAt = now
+	if e.store != nil {
+		if err := e.store.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
+			if err := repo.UpsertOrder(ctx, order); err != nil {
+				return fmt.Errorf("persist paper order: %w", err)
+			}
+			return repo.IncrementFreeOrders(ctx, order.TradeDate, order.InstrumentUID, 1)
+		}); err != nil {
+			return domain.Order{}, err
+		}
+	}
+	return order, nil
 }
 
 func (e *Engine) findExisting(ctx context.Context, order domain.Order) (domain.Order, error) {
@@ -286,6 +312,9 @@ func (e *Engine) MonitorUntil(ctx context.Context, order domain.Order, cfg Monit
 }
 
 func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConfig, remaining int64) (domain.Order, error) {
+	if err := e.ensureRepostBudget(ctx, order, cfg.Instrument); err != nil {
+		return domain.Order{}, err
+	}
 	if err := e.Cancel(ctx, order); err != nil {
 		return domain.Order{}, err
 	}
@@ -308,18 +337,28 @@ func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConf
 	}
 }
 
+func (e *Engine) ensureRepostBudget(ctx context.Context, order domain.Order, instrument domain.Instrument) error {
+	if e.store == nil || instrument.FreeOrderLimitPerDay <= 0 {
+		return nil
+	}
+	sent, err := e.store.GetFreeOrdersSent(ctx, order.TradeDate, instrument.InstrumentUID)
+	if err != nil {
+		return err
+	}
+	if instrument.FreeOrderLimitPerDay-sent < 1 {
+		return fmt.Errorf("%w: %s remaining=0", risk.ErrFreeOrderBudget, instrument.InstrumentUID)
+	}
+	return nil
+}
+
 func (e *Engine) checkQuoteFresh(book domain.OrderBook) error {
 	if e.maxQuoteAge <= 0 {
 		return nil
 	}
-	receivedAt := book.ReceivedAt
-	if receivedAt.IsZero() {
-		receivedAt = book.Time
+	if book.ReceivedAt.IsZero() {
+		return fmt.Errorf("quote received timestamp is missing")
 	}
-	if receivedAt.IsZero() {
-		return fmt.Errorf("quote timestamp is missing")
-	}
-	age := time.Since(receivedAt)
+	age := time.Since(book.ReceivedAt)
 	if age > e.maxQuoteAge {
 		return fmt.Errorf("quote age %s exceeds %s", age, e.maxQuoteAge)
 	}

@@ -51,6 +51,7 @@ func TestMinuteExecutionRequiresReachableLimitAndParticipation(t *testing.T) {
 	}
 	minutes := []domain.Candle{
 		{TradeDate: entryDate, Low: decimal.NewFromInt(99), High: decimal.NewFromInt(101), VolumeLots: decimal.NewFromInt(20)},
+		{TradeDate: time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC), Low: decimal.NewFromInt(1), High: decimal.NewFromInt(200), VolumeLots: decimal.NewFromInt(1_000_000)},
 		{TradeDate: exitDate, Low: decimal.NewFromInt(104), High: decimal.NewFromInt(106), VolumeLots: decimal.NewFromInt(20)},
 	}
 	lots, capacity, ok := engine.minuteExecution(c, minutes, 5)

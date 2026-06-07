@@ -251,7 +251,7 @@ func (g *RealGateway) GetPortfolio(ctx context.Context, accountID string) (domai
 	for _, position := range positions {
 		holdings = append(holdings, domain.Holding{
 			InstrumentUID: position.GetInstrumentUid(),
-			QuantityLots:  money.QuotationToDecimal(position.GetQuantity()).IntPart(),
+			QuantityLots:  portfolioQuantityLots(position),
 			AveragePrice:  money.MoneyValueToDecimal(position.GetAveragePositionPrice()),
 			MarketValue:   money.MoneyValueToDecimal(position.GetCurrentPrice()).Mul(money.QuotationToDecimal(position.GetQuantity())),
 		})
@@ -335,6 +335,29 @@ func rubMoneyValueToDecimal(value *pb.MoneyValue) (decimal.Decimal, error) {
 		return decimal.Zero, fmt.Errorf("expected RUB money value, got %s", currency)
 	}
 	return money.MoneyValueToDecimal(value), nil
+}
+
+func portfolioQuantityLots(position *pb.PortfolioPosition) int64 {
+	if position == nil {
+		return 0
+	}
+	if lots, ok := portfolioDeprecatedQuantityLots(position); ok {
+		return lots.IntPart()
+	}
+	return money.QuotationToDecimal(position.GetQuantity()).IntPart()
+}
+
+func portfolioDeprecatedQuantityLots(position *pb.PortfolioPosition) (decimal.Decimal, bool) {
+	message := position.ProtoReflect()
+	field := message.Descriptor().Fields().ByName("quantity_lots")
+	if field == nil || !message.Has(field) {
+		return decimal.Zero, false
+	}
+	quotation, ok := message.Get(field).Message().Interface().(*pb.Quotation)
+	if !ok || quotation == nil {
+		return decimal.Zero, false
+	}
+	return money.QuotationToDecimal(quotation), true
 }
 
 func serverTimeFromHeader(header map[string][]string) (time.Time, bool) {

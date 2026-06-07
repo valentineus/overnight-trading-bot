@@ -4,7 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +14,7 @@ import (
 	"overnight-trading-bot/internal/money"
 )
 
-var nonIDChar = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+const maxClientOrderIDLen = 36
 
 func LimitBuyPrice(bestBid, bestAsk, tick decimal.Decimal, improveTicks int) (decimal.Decimal, error) {
 	if improveTicks < 0 {
@@ -49,10 +49,25 @@ func LimitSellPrice(bestBid, bestAsk, tick decimal.Decimal, improveTicks int) (d
 func ClientOrderID(tradeDate time.Time, instrumentUID string, side domain.Side, attempt int) string {
 	base := fmt.Sprintf("%s|%s|%s|%d", tradeDate.Format("20060102"), instrumentUID, side, attempt)
 	sum := sha256.Sum256([]byte(base))
-	suffix := hex.EncodeToString(sum[:])[:8]
-	cleanUID := nonIDChar.ReplaceAllString(instrumentUID, "_")
-	if len(cleanUID) > 24 {
-		cleanUID = cleanUID[:24]
+	suffix := hex.EncodeToString(sum[:])
+	sideToken := "b"
+	if side == domain.SideSell {
+		sideToken = "s"
 	}
-	return strings.ToLower(fmt.Sprintf("otb-%s-%s-%s-%02d-%s", tradeDate.Format("20060102"), cleanUID, side, attempt, suffix))
+	prefix := fmt.Sprintf("otb-%s-%s-%s-", tradeDate.Format("20060102"), sideToken, attemptToken(attempt))
+	return strings.ToLower(prefix + suffix[:maxClientOrderIDLen-len(prefix)])
+}
+
+func attemptToken(attempt int) string {
+	if attempt < 0 {
+		attempt = 0
+	}
+	token := strings.ToLower(strconv.FormatInt(int64(attempt), 36))
+	if len(token) > 2 {
+		token = token[len(token)-2:]
+	}
+	for len(token) < 2 {
+		token = "0" + token
+	}
+	return token
 }

@@ -101,6 +101,47 @@ func TestCompareOperationsCommissionPerInstrument(t *testing.T) {
 	}
 }
 
+func TestReconciliationQuarantinesOnNonZeroBrokerCommission(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	if err := repo.UpsertInstrument(ctx, domain.Instrument{
+		InstrumentUID: "uid",
+		Ticker:        "TRUR",
+		Enabled:       true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Operations = []domain.Operation{{
+		InstrumentUID: "uid",
+		Type:          "OPERATION_TYPE_BROKER_FEE",
+		Commission:    decimal.NewFromFloat(0.01),
+		ExecutedAt:    time.Now().UTC(),
+	}}
+	diffs, err := New(repo, gateway, "account", "hash").
+		WithCommissionPolicy(true, true, decimal.NewFromFloat(0.01)).
+		Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, diff := range diffs {
+		if diff.Kind == "actual_commission_nonzero" && diff.Critical {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected actual_commission_nonzero diff, got %+v", diffs)
+	}
+	instruments, err := repo.ListInstruments(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instruments) != 1 || !instruments[0].Quarantine {
+		t.Fatalf("instrument not quarantined: %+v", instruments)
+	}
+}
+
 func TestReconciliationSkipsFreshInFlightLocalOrders(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

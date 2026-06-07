@@ -59,6 +59,9 @@ type outbound struct {
 
 func NewTelegram(cfg TelegramConfig, log *slog.Logger) (Notifier, error) {
 	if cfg.BotToken == "" || cfg.ChatID == 0 {
+		if log != nil {
+			log.Warn("telegram notifier disabled; TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty")
+		}
 		return Noop{}, nil
 	}
 	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)

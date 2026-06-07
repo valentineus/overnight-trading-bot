@@ -3,7 +3,6 @@ package instruments
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/repository"
@@ -25,21 +24,19 @@ func (r Registry) SyncMetadata(ctx context.Context) error {
 		return err
 	}
 	for _, instrument := range instruments {
-		if strings.HasPrefix(instrument.InstrumentUID, "PENDING:") || !instrument.MetadataValid() {
-			remote, err := r.gateway.GetInstrument(ctx, instrument.Ticker, instrument.ClassCode)
-			if err != nil {
-				return fmt.Errorf("sync %s: %w", instrument.Ticker, err)
-			}
-			remote.Enabled = instrument.Enabled && remote.Enabled
-			remote.FundType = instrument.FundType
-			remote.ExpectedCommissionBpsPerSide = instrument.ExpectedCommissionBpsPerSide
-			remote.FreeOrderLimitPerDay = instrument.FreeOrderLimitPerDay
-			remote.Quarantine = instrument.Quarantine
-			remote.QuarantineReason = instrument.QuarantineReason
-			remote.ExcludeReason = instrument.ExcludeReason
-			if err := r.repo.ReplaceInstrument(ctx, instrument.InstrumentUID, remote); err != nil {
-				return fmt.Errorf("replace synced instrument %s: %w", instrument.Ticker, err)
-			}
+		remote, err := r.gateway.GetInstrument(ctx, instrument.Ticker, instrument.ClassCode)
+		if err != nil {
+			return fmt.Errorf("sync %s: %w", instrument.Ticker, err)
+		}
+		remote.Enabled = instrument.Enabled && remote.Enabled
+		remote.FundType = instrument.FundType
+		remote.ExpectedCommissionBpsPerSide = instrument.ExpectedCommissionBpsPerSide
+		remote.FreeOrderLimitPerDay = instrument.FreeOrderLimitPerDay
+		remote.Quarantine = instrument.Quarantine
+		remote.QuarantineReason = instrument.QuarantineReason
+		remote.ExcludeReason = instrument.ExcludeReason
+		if err := r.repo.ReplaceInstrument(ctx, instrument.InstrumentUID, remote); err != nil {
+			return fmt.Errorf("replace synced instrument %s: %w", instrument.Ticker, err)
 		}
 	}
 	return nil

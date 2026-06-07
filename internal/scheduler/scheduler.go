@@ -30,32 +30,36 @@ import (
 )
 
 const (
-	sizeReductionWindowTrades = 20
-	sizeReductionFactor       = 0.5
+	sizeReductionWindowTrades  = 20
+	sizeReductionFactor        = 0.5
+	intervalVolumeLookbackDays = 20
 )
 
 type Config struct {
-	Mode                  domain.Mode
-	Location              *time.Location
-	RollingLong           int
-	TickInterval          time.Duration
-	EntrySignalTime       timeutil.TimeOfDay
-	EntryWindowStart      timeutil.TimeOfDay
-	EntryWindowEnd        timeutil.TimeOfDay
-	NoNewEntryAfter       timeutil.TimeOfDay
-	ExitWatchStart        timeutil.TimeOfDay
-	ExitWindowStart       timeutil.TimeOfDay
-	ExitWindowEnd         timeutil.TimeOfDay
-	HardExitDeadline      timeutil.TimeOfDay
-	QuoteDepth            int32
-	MaxQuoteAge           time.Duration
-	OrderPollInterval     time.Duration
-	PassiveImproveTicks   int
-	MaxEntryOrderAttempts int
-	MaxExitOrderAttempts  int
-	MinTimeToClose        time.Duration
-	MaxClockDrift         time.Duration
-	APIOutageHalt         time.Duration
+	Mode                   domain.Mode
+	Location               *time.Location
+	RollingLong            int
+	TickInterval           time.Duration
+	EntrySignalTime        timeutil.TimeOfDay
+	EntryWindowStart       timeutil.TimeOfDay
+	EntryWindowEnd         timeutil.TimeOfDay
+	NoNewEntryAfter        timeutil.TimeOfDay
+	ExitWatchStart         timeutil.TimeOfDay
+	ExitWindowStart        timeutil.TimeOfDay
+	ExitWindowEnd          timeutil.TimeOfDay
+	HardExitDeadline       timeutil.TimeOfDay
+	QuoteDepth             int32
+	MaxQuoteAge            time.Duration
+	OrderPollInterval      time.Duration
+	PassiveImproveTicks    int
+	MaxEntryOrderAttempts  int
+	MaxExitOrderAttempts   int
+	MinTimeToClose         time.Duration
+	MaxClockDrift          time.Duration
+	APIOutageHalt          time.Duration
+	RequireZeroCommission  bool
+	QuarantineOnNonZero    bool
+	ReconciliationInterval time.Duration
 }
 
 type Services struct {
@@ -84,6 +88,7 @@ type Scheduler struct {
 	svc   Services
 
 	infraFailedSince time.Time
+	lastReconciledAt time.Time
 }
 
 func New(clock timeutil.Clock, sm statemachine.System, cfg Config, svc Services) Scheduler {
@@ -92,6 +97,9 @@ func New(clock timeutil.Clock, sm statemachine.System, cfg Config, svc Services)
 	}
 	if cfg.Location == nil {
 		cfg.Location = time.UTC
+	}
+	if cfg.ReconciliationInterval <= 0 {
+		cfg.ReconciliationInterval = 5 * time.Minute
 	}
 	return Scheduler{clock: clock, sm: sm, cfg: cfg, svc: svc}
 }
@@ -181,8 +189,8 @@ func (s *Scheduler) prepareSignals(ctx context.Context, now time.Time) error {
 	if err := s.svc.MarketData.BackfillDaily(ctx, instrumentsList, tradeDate.AddDate(0, 0, -s.cfg.RollingLong-10), tradeDate); err != nil {
 		return err
 	}
-	minuteFrom := s.cfg.EntryWindowStart.On(tradeDate, s.cfg.Location)
-	minuteTo := s.cfg.ExitWindowEnd.On(tradeDate.AddDate(0, 0, 1), s.cfg.Location)
+	minuteFrom := s.cfg.EntryWindowStart.On(tradeDate.AddDate(0, 0, -intervalVolumeLookbackDays), s.cfg.Location)
+	minuteTo := s.cfg.ExitWindowEnd.On(tradeDate, s.cfg.Location)
 	if err := s.svc.MarketData.BackfillMinute(ctx, instrumentsList, minuteFrom, minuteTo); err != nil {
 		s.logWarn("minute backfill failed; liquidity will fall back to ADV", "err", err)
 	}
@@ -222,7 +230,7 @@ func (s Scheduler) generateInstrumentSignal(ctx context.Context, now, tradeDate 
 	if err != nil {
 		return s.saveRejectedSignal(ctx, tradeDate, instrument, "features_unavailable", err)
 	}
-	remaining, err := s.svc.FreeOrders.Check(ctx, tradeDate, instrument, 1)
+	remaining, err := s.svc.FreeOrders.Check(ctx, tradeDate, instrument, s.maxOrderAttemptsPerTrade())
 	freeOrderOK := err == nil
 	sig := s.svc.Signals.Evaluate(signal.Candidate{
 		Instrument:    instrument,
@@ -234,6 +242,7 @@ func (s Scheduler) generateInstrumentSignal(ctx context.Context, now, tradeDate 
 		ExtraContext: map[string]any{
 			"free_orders_remaining": remaining,
 			"quote_time":            book.Time.Format(time.RFC3339),
+			"spread_bps":            spread.SpreadBps.String(),
 		},
 	})
 	if sig.Decision == domain.DecisionEnter {
@@ -244,6 +253,9 @@ func (s Scheduler) generateInstrumentSignal(ctx context.Context, now, tradeDate 
 			sig.RejectReason = sizingErr.Error()
 		case sized.Lots <= 0:
 			sig.Decision = domain.DecisionReject
+			if isSizingSkipReason(sized.Reason) {
+				sig.Decision = domain.DecisionSkip
+			}
 			sig.RejectReason = sized.Reason
 		default:
 			sig.TargetLots = sized.Lots
@@ -288,11 +300,15 @@ func (s Scheduler) sizeSignal(_ context.Context, portfolio domain.Portfolio, ins
 	}), nil
 }
 
-func (s Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
+func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 	if err := s.transitionTo(ctx, domain.StatePlaceEntryOrders); err != nil {
 		return err
 	}
 	tradeDate := tradingDate(now)
+	entryDeadline := s.cfg.NoNewEntryAfter.On(now, s.cfg.Location).UTC()
+	if !s.nowUTC().Before(entryDeadline) {
+		return s.closeEntryWindow(ctx)
+	}
 	signals, err := s.svc.Repo.ListSignals(ctx, tradeDate)
 	if err != nil {
 		return err
@@ -316,6 +332,21 @@ func (s Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 		instrument, ok := instrumentByUID[sig.InstrumentUID]
 		if !ok {
 			return fmt.Errorf("instrument %s is not in registry", sig.InstrumentUID)
+		}
+		if !s.nowUTC().Before(entryDeadline) {
+			return s.closeEntryWindow(ctx)
+		}
+		if _, err := s.svc.FreeOrders.Check(ctx, tradeDate, instrument, s.maxOrderAttemptsPerTrade()); err != nil {
+			if insertErr := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+				Severity:      domain.SeverityWarn,
+				EventType:     "pre_trade_reject",
+				InstrumentUID: sig.InstrumentUID,
+				Message:       err.Error(),
+				ContextJSON:   `{"reason":"free_order_budget_insufficient"}`,
+			}); insertErr != nil {
+				return insertErr
+			}
+			continue
 		}
 		book, err := s.svc.MarketData.LatestQuote(ctx, sig.InstrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
 		if err != nil {
@@ -354,12 +385,17 @@ func (s Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 			return err
 		}
 		_ = s.svc.Notifier.Info(ctx, fmt.Sprintf("entry order %s %s lots=%d status=%s", instrument.Ticker, placed.Side, placed.QuantityLots, placed.Status))
+		if placed.FilledLots > 0 {
+			if err := s.recordEntryFill(ctx, instrument, placed); err != nil {
+				return err
+			}
+		}
 		existing = append(existing, placed)
 	}
 	return s.transitionTo(ctx, domain.StateMonitorEntryOrders)
 }
 
-func (s Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error {
+func (s *Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error {
 	if err := s.transitionTo(ctx, domain.StateMonitorEntryOrders); err != nil {
 		return err
 	}
@@ -372,6 +408,9 @@ func (s Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error 
 		return err
 	}
 	deadline := s.cfg.NoNewEntryAfter.On(now, s.cfg.Location).UTC()
+	if !s.nowUTC().Before(deadline) {
+		return s.closeEntryWindow(ctx)
+	}
 	for _, order := range orders {
 		if order.Side != domain.SideBuy || order.BrokerOrderID == "" {
 			continue
@@ -395,18 +434,13 @@ func (s Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error 
 			return err
 		}
 		if monitored.FilledLots > order.FilledLots || monitored.Commission.GreaterThan(order.Commission) {
-			pos, err := s.svc.Positions.OnEntryFill(ctx, s.svc.AccountIDHash, instrument, monitored)
-			if err != nil {
+			if err := s.recordEntryFill(ctx, instrument, monitored); err != nil {
 				return err
 			}
-			_ = s.svc.Notifier.Info(ctx, fmt.Sprintf("entry fill %s lots=%d status=%s", monitored.InstrumentUID, monitored.FilledLots, pos.Status))
 		}
 	}
 	if sinceMidnight(s.nowUTC().In(s.cfg.Location)) >= s.cfg.NoNewEntryAfter.Duration {
-		if err := s.cancelActiveOrders(ctx, domain.SideBuy, domain.OrderStatusCancelled, "entry_window_closed"); err != nil {
-			return err
-		}
-		return s.transitionTo(ctx, domain.StateHoldOvernight)
+		return s.closeEntryWindow(ctx)
 	}
 	return nil
 }
@@ -415,14 +449,14 @@ func (s Scheduler) waitExit(ctx context.Context, _ time.Time) error {
 	return s.transitionTo(ctx, domain.StateWaitExitWindow)
 }
 
-func (s Scheduler) holdOvernight(ctx context.Context) error {
-	if err := s.cancelActiveOrders(ctx, domain.SideBuy, domain.OrderStatusCancelled, "entry_window_closed"); err != nil {
+func (s *Scheduler) holdOvernight(ctx context.Context) error {
+	if err := s.closeEntryWindow(ctx); err != nil {
 		return err
 	}
-	return s.transitionTo(ctx, domain.StateHoldOvernight)
+	return s.periodicReconcile(ctx)
 }
 
-func (s Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
+func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 	if err := s.transitionTo(ctx, domain.StatePlaceExitOrders); err != nil {
 		return err
 	}
@@ -473,6 +507,13 @@ func (s Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		if err != nil && !errors.Is(err, execution.ErrBrokerOrdersDisabled) {
 			return err
 		}
+		if placed.FilledLots > 0 || placed.Commission.IsPositive() {
+			if err := s.recordExitFill(ctx, pos, placed); err != nil {
+				return err
+			}
+			existing = append(existing, placed)
+			continue
+		}
 		pos.Status = domain.PositionExitOrderSent
 		if err := s.svc.Repo.UpsertPosition(ctx, pos); err != nil {
 			return err
@@ -483,7 +524,7 @@ func (s Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 	return s.transitionTo(ctx, domain.StateMonitorExitOrders)
 }
 
-func (s Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error {
+func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error {
 	if err := s.transitionTo(ctx, domain.StateMonitorExitOrders); err != nil {
 		return err
 	}
@@ -535,12 +576,11 @@ func (s Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error {
 			if !ok {
 				return fmt.Errorf("exit fill for unknown local position %s", monitored.InstrumentUID)
 			}
-			updated, err := s.svc.Positions.OnExitFill(ctx, pos, fill)
+			updated, err := s.recordExitFillWithPosition(ctx, pos, fill)
 			if err != nil {
 				return err
 			}
 			positionByInstrument[monitored.InstrumentUID] = updated
-			_ = s.svc.Notifier.Info(ctx, fmt.Sprintf("exit fill %s lots=%d status=%s pnl=%s", monitored.InstrumentUID, monitored.FilledLots, updated.Status, updated.NetPnL.StringFixed(2)))
 		}
 	}
 	if sinceMidnight(s.nowUTC().In(s.cfg.Location)) >= s.cfg.HardExitDeadline.Duration {
@@ -550,16 +590,6 @@ func (s Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error {
 }
 
 func (s *Scheduler) reconcileAndReport(ctx context.Context, now time.Time) error {
-	if err := s.transitionTo(ctx, domain.StateReconcile); err != nil {
-		return err
-	}
-	diffs, err := s.svc.Reconcile.Run(ctx)
-	if err != nil {
-		return err
-	}
-	if reconciliation.HasCritical(diffs) {
-		return s.halt(ctx, "reconciliation_critical", "critical reconciliation diff", "")
-	}
 	tradeDate := tradingDate(now)
 	sent, err := s.svc.Repo.WasDailyReportSent(ctx, tradeDate, s.svc.AccountIDHash)
 	if err != nil {
@@ -567,6 +597,28 @@ func (s *Scheduler) reconcileAndReport(ctx context.Context, now time.Time) error
 	}
 	if sent {
 		s.logWarn("daily report already sent; skipping duplicate", "date", tradeDate.Format("2006-01-02"))
+		return s.transitionTo(ctx, domain.StateSleep)
+	}
+	if err := s.transitionTo(ctx, domain.StateReconcile); err != nil {
+		return err
+	}
+	if err := s.reconcileCritical(ctx, "reconciliation_critical"); err != nil {
+		return err
+	}
+	return s.sendDailyReport(ctx, now, "ok")
+}
+
+func (s *Scheduler) sendDailyReport(ctx context.Context, now time.Time, riskStatus string) error {
+	tradeDate := tradingDate(now)
+	sent, err := s.svc.Repo.WasDailyReportSent(ctx, tradeDate, s.svc.AccountIDHash)
+	if err != nil {
+		return err
+	}
+	if sent {
+		s.logWarn("daily report already sent; skipping duplicate", "date", tradeDate.Format("2006-01-02"))
+		if !s.hasStateMachine() {
+			return nil
+		}
 		return s.transitionTo(ctx, domain.StateSleep)
 	}
 	signals, err := s.svc.Repo.ListSignals(ctx, tradeDate)
@@ -577,24 +629,34 @@ func (s *Scheduler) reconcileAndReport(ctx context.Context, now time.Time) error
 	if err != nil {
 		return err
 	}
+	orders, err := s.svc.Repo.ListOrders(ctx, s.svc.AccountIDHash, tradeDate.AddDate(0, 0, -1), tradeDate)
+	if err != nil {
+		return err
+	}
 	if err := s.applySizeReductionRule(ctx, tradeDate, true); err != nil {
 		return err
 	}
-	if err := s.transitionTo(ctx, domain.StateReport); err != nil {
-		return err
+	if s.hasStateMachine() {
+		if err := s.transitionTo(ctx, domain.StateReport); err != nil {
+			return err
+		}
 	}
 	msg := report.ComposeDaily(report.DailyInput{
 		Date:       tradeDate,
 		Mode:       s.cfg.Mode,
 		Signals:    signals,
 		Positions:  positionsList,
-		RiskStatus: "ok",
+		Orders:     orders,
+		RiskStatus: riskStatus,
 	})
 	if err := s.svc.Notifier.Report(ctx, msg); err != nil {
 		return err
 	}
 	if err := s.svc.Repo.MarkDailyReportSent(ctx, tradeDate, s.svc.AccountIDHash); err != nil {
 		return err
+	}
+	if !s.hasStateMachine() {
+		return nil
 	}
 	return s.transitionTo(ctx, domain.StateSleep)
 }
@@ -675,6 +737,7 @@ func (s *Scheduler) checkInfrastructure(ctx context.Context) error {
 	serverTime, err := s.svc.Gateway.GetServerTime(ctx)
 	if err != nil {
 		if s.cfg.Mode == domain.ModePaper {
+			s.infraFailedSince = time.Time{}
 			return nil
 		}
 		return s.recordInfrastructureFailure(fmt.Errorf("server_time_unavailable: %w", err))
@@ -737,7 +800,96 @@ func (s Scheduler) cancelActiveOrders(ctx context.Context, side domain.Side, fal
 	return nil
 }
 
-func (s Scheduler) failOpenPositionsAtHardDeadline(ctx context.Context) error {
+func (s Scheduler) closeEntryWindow(ctx context.Context) error {
+	if err := s.cancelActiveOrders(ctx, domain.SideBuy, domain.OrderStatusCancelled, "entry_window_closed"); err != nil {
+		return err
+	}
+	return s.transitionTo(ctx, domain.StateHoldOvernight)
+}
+
+func (s *Scheduler) recordEntryFill(ctx context.Context, instrument domain.Instrument, order domain.Order) error {
+	pos, err := s.svc.Positions.OnEntryFill(ctx, s.svc.AccountIDHash, instrument, order)
+	if err != nil {
+		return err
+	}
+	_ = s.svc.Notifier.Info(ctx, fmt.Sprintf("entry fill %s lots=%d status=%s", order.InstrumentUID, order.FilledLots, pos.Status))
+	if err := s.handleCommission(ctx, order.InstrumentUID, order.Commission); err != nil {
+		return err
+	}
+	return s.reconcileAfterFill(ctx)
+}
+
+func (s *Scheduler) recordExitFill(ctx context.Context, pos domain.Position, order domain.Order) error {
+	_, err := s.recordExitFillWithPosition(ctx, pos, order)
+	return err
+}
+
+func (s *Scheduler) recordExitFillWithPosition(ctx context.Context, pos domain.Position, fill domain.Order) (domain.Position, error) {
+	updated, err := s.svc.Positions.OnExitFill(ctx, pos, fill)
+	if err != nil {
+		return domain.Position{}, err
+	}
+	_ = s.svc.Notifier.Info(ctx, fmt.Sprintf("exit fill %s lots=%d status=%s pnl=%s", fill.InstrumentUID, fill.FilledLots, updated.Status, updated.NetPnL.StringFixed(2)))
+	if err := s.handleCommission(ctx, fill.InstrumentUID, fill.Commission); err != nil {
+		return domain.Position{}, err
+	}
+	if err := s.reconcileAfterFill(ctx); err != nil {
+		return domain.Position{}, err
+	}
+	return updated, nil
+}
+
+func (s *Scheduler) handleCommission(ctx context.Context, instrumentUID string, commission decimal.Decimal) error {
+	if !risk.CommissionBreached(commission, s.cfg.RequireZeroCommission) {
+		return nil
+	}
+	reason := fmt.Sprintf("actual commission %s > 0", commission.StringFixed(2))
+	if s.cfg.QuarantineOnNonZero {
+		if err := s.svc.Repo.QuarantineInstrument(ctx, instrumentUID, reason); err != nil {
+			return err
+		}
+	}
+	return s.halt(ctx, "actual_commission_nonzero", reason, instrumentUID)
+}
+
+func (s *Scheduler) reconcileAfterFill(ctx context.Context) error {
+	if !s.cfg.Mode.AllowsBrokerOrders() {
+		return nil
+	}
+	return s.reconcileCritical(ctx, "reconciliation_after_fill_critical")
+}
+
+func (s *Scheduler) periodicReconcile(ctx context.Context) error {
+	if !s.cfg.Mode.AllowsBrokerOrders() {
+		return nil
+	}
+	now := s.nowUTC()
+	if !s.lastReconciledAt.IsZero() && now.Sub(s.lastReconciledAt) < s.cfg.ReconciliationInterval {
+		return nil
+	}
+	return s.reconcileCritical(ctx, "periodic_reconciliation_critical")
+}
+
+func (s *Scheduler) reconcileCritical(ctx context.Context, eventType string) error {
+	diffs, err := s.svc.Reconcile.Run(ctx)
+	if err != nil {
+		return err
+	}
+	s.lastReconciledAt = s.nowUTC()
+	for _, diff := range diffs {
+		if diff.Kind == "actual_commission_nonzero" && diff.InstrumentUID != "" && s.cfg.QuarantineOnNonZero {
+			if err := s.svc.Repo.QuarantineInstrument(ctx, diff.InstrumentUID, diff.Message); err != nil {
+				return err
+			}
+		}
+	}
+	if reconciliation.HasCritical(diffs) {
+		return s.halt(ctx, eventType, "critical reconciliation diff", "")
+	}
+	return nil
+}
+
+func (s *Scheduler) failOpenPositionsAtHardDeadline(ctx context.Context) error {
 	if err := s.cancelActiveOrders(ctx, domain.SideSell, domain.OrderStatusExpired, "hard_exit_deadline_cancel"); err != nil {
 		return err
 	}
@@ -762,6 +914,9 @@ func (s Scheduler) failOpenPositionsAtHardDeadline(ctx context.Context) error {
 	}
 	if len(failed) == 0 {
 		return s.reconcileAndReport(ctx, s.nowUTC().In(s.cfg.Location))
+	}
+	if err := s.sendDailyReport(ctx, s.nowUTC().In(s.cfg.Location), "hard_exit_deadline_missed"); err != nil {
+		s.logWarn("daily report failed after hard deadline", "err", err)
 	}
 	return s.svc.Risk.Halt(ctx, s.cfg.Mode, "hard_exit_deadline_missed", fmt.Sprintf("%d positions remain open after hard deadline", len(failed)), "")
 }
@@ -791,6 +946,22 @@ func repostAfter(now, deadline time.Time, attempts int, poll time.Duration) time
 	return after
 }
 
+func (s Scheduler) maxOrderAttemptsPerTrade() int {
+	needed := s.cfg.MaxEntryOrderAttempts + s.cfg.MaxExitOrderAttempts
+	if needed <= 0 {
+		return 1
+	}
+	return needed
+}
+
+func isSizingSkipReason(reason string) bool {
+	return reason == "lots_below_one" || reason == "min_order_notional"
+}
+
+func (s Scheduler) hasStateMachine() bool {
+	return s.sm != (statemachine.System{})
+}
+
 func (s Scheduler) transitionSequence(ctx context.Context, states ...domain.SystemState) error {
 	for _, state := range states {
 		if err := s.transitionTo(ctx, state); err != nil {
@@ -812,9 +983,6 @@ func (s Scheduler) transitionTo(ctx context.Context, to domain.SystemState) erro
 		return s.sm.Heartbeat(ctx, to)
 	}
 	if err := s.sm.Transition(ctx, from, to); err != nil {
-		if errors.Is(err, statemachine.ErrIllegalTransition) {
-			return s.sm.Heartbeat(ctx, to)
-		}
 		return err
 	}
 	return nil

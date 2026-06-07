@@ -45,6 +45,13 @@ type Config struct {
 	AssumedTickBps         decimal.Decimal
 	Lot                    int64
 	UseMinuteModel         bool
+	EntryWindow            TimeWindow
+	ExitWindow             TimeWindow
+}
+
+type TimeWindow struct {
+	Start time.Duration
+	End   time.Duration
 }
 
 type Trade struct {
@@ -142,6 +149,12 @@ func (cfg Config) withDefaults() Config {
 	if cfg.Lot == 0 {
 		cfg.Lot = 1
 	}
+	if cfg.EntryWindow.Start == 0 && cfg.EntryWindow.End == 0 {
+		cfg.EntryWindow = TimeWindow{Start: durationOfDay(18, 20, 0), End: durationOfDay(18, 38, 30)}
+	}
+	if cfg.ExitWindow.Start == 0 && cfg.ExitWindow.End == 0 {
+		cfg.ExitWindow = TimeWindow{Start: durationOfDay(10, 5, 0), End: durationOfDay(10, 25, 0)}
+	}
 	return cfg
 }
 
@@ -153,8 +166,12 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 	prepared := prepareCandles(candlesByInstrument)
 	preparedMinutes := prepareCandles(minuteCandlesByInstrument)
 	candidatesByExitDate := make(map[string][]candidate)
+	tradingDateSet := make(map[string]struct{})
 	for instrumentUID, candles := range prepared {
 		for i := 1; i < len(candles); i++ {
+			if i >= e.cfg.RollingShort {
+				tradingDateSet[candles[i].TradeDate.Format("2006-01-02")] = struct{}{}
+			}
 			candidate, ok, err := e.evaluateCandidate(instrumentUID, candles, i)
 			if err != nil {
 				return Result{}, err
@@ -164,8 +181,8 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 			}
 		}
 	}
-	dates := make([]string, 0, len(candidatesByExitDate))
-	for date := range candidatesByExitDate {
+	dates := make([]string, 0, len(tradingDateSet))
+	for date := range tradingDateSet {
 		dates = append(dates, date)
 	}
 	sort.Strings(dates)
@@ -239,15 +256,17 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 				CapacityRUB:   capacity,
 			})
 		}
-		if !dayPnL.IsZero() {
-			equity = equity.Add(dayPnL)
-			cash = equity
-			points = append(points, Point{
-				Date:   date,
-				Equity: equity,
-				Return: dayPnL.Div(dayStartEquity),
-			})
+		equity = equity.Add(dayPnL)
+		cash = equity
+		dayReturn := decimal.Zero
+		if dayStartEquity.IsPositive() {
+			dayReturn = dayPnL.Div(dayStartEquity)
 		}
+		points = append(points, Point{
+			Date:   date,
+			Equity: equity,
+			Return: dayReturn,
+		})
 	}
 	sort.Slice(trades, func(i, j int) bool {
 		if trades[i].ExitDate == trades[j].ExitDate {
@@ -266,8 +285,8 @@ func (e Engine) minuteExecution(c candidate, minutes []domain.Candle, requestedL
 	if requestedLots <= 0 || len(minutes) == 0 {
 		return 0, decimal.Zero, false
 	}
-	entryLots, entryCapacity := e.fillableMinuteLots(minutes, c.entry.TradeDate, c.buy, domain.SideBuy)
-	exitLots, exitCapacity := e.fillableMinuteLots(minutes, c.exit.TradeDate, c.sell, domain.SideSell)
+	entryLots, entryCapacity := e.fillableMinuteLots(minutes, c.entry.TradeDate, c.buy, domain.SideBuy, e.cfg.EntryWindow)
+	exitLots, exitCapacity := e.fillableMinuteLots(minutes, c.exit.TradeDate, c.sell, domain.SideSell, e.cfg.ExitWindow)
 	lots := min(requestedLots, entryLots)
 	lots = min(lots, exitLots)
 	if lots <= 0 {
@@ -276,7 +295,7 @@ func (e Engine) minuteExecution(c candidate, minutes []domain.Candle, requestedL
 	return lots, money.Min(entryCapacity, exitCapacity), true
 }
 
-func (e Engine) fillableMinuteLots(minutes []domain.Candle, date time.Time, limitPrice decimal.Decimal, side domain.Side) (int64, decimal.Decimal) {
+func (e Engine) fillableMinuteLots(minutes []domain.Candle, date time.Time, limitPrice decimal.Decimal, side domain.Side, window TimeWindow) (int64, decimal.Decimal) {
 	if !limitPrice.IsPositive() || e.cfg.Lot <= 0 {
 		return 0, decimal.Zero
 	}
@@ -289,6 +308,9 @@ func (e Engine) fillableMinuteLots(minutes []domain.Candle, date time.Time, limi
 		if !sameDate(candle.TradeDate, date) {
 			continue
 		}
+		if !window.Contains(candle.TradeDate) {
+			continue
+		}
 		reachable := side == domain.SideBuy && candle.Low.LessThanOrEqual(limitPrice)
 		reachable = reachable || side == domain.SideSell && candle.High.GreaterThanOrEqual(limitPrice)
 		if !reachable {
@@ -298,6 +320,22 @@ func (e Engine) fillableMinuteLots(minutes []domain.Candle, date time.Time, limi
 		capacity = capacity.Add(minuteCapacity)
 	}
 	return capacity.Div(lotNotional).Floor().IntPart(), capacity
+}
+
+func (w TimeWindow) Contains(ts time.Time) bool {
+	if w.Start == 0 && w.End == 0 {
+		return true
+	}
+	tod := time.Duration(ts.Hour())*time.Hour +
+		time.Duration(ts.Minute())*time.Minute +
+		time.Duration(ts.Second())*time.Second
+	return tod >= w.Start && tod <= w.End
+}
+
+func durationOfDay(hour, minute, second int) time.Duration {
+	return time.Duration(hour)*time.Hour +
+		time.Duration(minute)*time.Minute +
+		time.Duration(second)*time.Second
 }
 
 type candidate struct {

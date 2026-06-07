@@ -16,16 +16,26 @@ import (
 )
 
 type Engine struct {
-	repo          repository.Repository
-	gateway       tinvest.Gateway
-	accountID     string
-	accountIDHash string
-	window        time.Duration
-	inFlightGrace time.Duration
+	repo                  repository.Repository
+	gateway               tinvest.Gateway
+	accountID             string
+	accountIDHash         string
+	window                time.Duration
+	inFlightGrace         time.Duration
+	commissionTolerance   decimal.Decimal
+	requireZeroCommission bool
+	quarantineOnNonZero   bool
 }
 
 func New(repo repository.Repository, gateway tinvest.Gateway, accountID, accountIDHash string) Engine {
-	return Engine{repo: repo, gateway: gateway, accountID: accountID, accountIDHash: accountIDHash, window: 72 * time.Hour}
+	return Engine{
+		repo:                repo,
+		gateway:             gateway,
+		accountID:           accountID,
+		accountIDHash:       accountIDHash,
+		window:              72 * time.Hour,
+		commissionTolerance: decimal.NewFromFloat(0.01),
+	}
 }
 
 func (e Engine) WithWindow(window time.Duration) Engine {
@@ -38,6 +48,15 @@ func (e Engine) WithWindow(window time.Duration) Engine {
 func (e Engine) WithInFlightGrace(grace time.Duration) Engine {
 	if grace >= 0 {
 		e.inFlightGrace = grace
+	}
+	return e
+}
+
+func (e Engine) WithCommissionPolicy(requireZero, quarantineOnNonZero bool, tolerance decimal.Decimal) Engine {
+	e.requireZeroCommission = requireZero
+	e.quarantineOnNonZero = quarantineOnNonZero
+	if !tolerance.IsNegative() {
+		e.commissionTolerance = tolerance
 	}
 	return e
 }
@@ -138,7 +157,17 @@ func (e Engine) Run(ctx context.Context) ([]domain.ReconciliationDiff, error) {
 	if err != nil {
 		return nil, err
 	}
-	diffs = append(diffs, compareOperations(recentOrders, operations)...)
+	diffs = append(diffs, compareOperationsWithPolicy(recentOrders, operations, e.requireZeroCommission, e.commissionTolerance)...)
+	if e.requireZeroCommission && e.quarantineOnNonZero {
+		for _, diff := range diffs {
+			if diff.Kind != "actual_commission_nonzero" || diff.InstrumentUID == "" {
+				continue
+			}
+			if err := e.repo.QuarantineInstrument(ctx, diff.InstrumentUID, diff.Message); err != nil {
+				return nil, err
+			}
+		}
+	}
 	raw, _ := json.Marshal(diffs)
 	if err := e.repo.InsertReconciliation(ctx, now, string(raw), len(diffs) > 0); err != nil {
 		return nil, err
@@ -163,7 +192,14 @@ func HasCritical(diffs []domain.ReconciliationDiff) bool {
 }
 
 func compareOperations(orders []domain.Order, operations []domain.Operation) []domain.ReconciliationDiff {
+	return compareOperationsWithPolicy(orders, operations, false, decimal.NewFromFloat(0.01))
+}
+
+func compareOperationsWithPolicy(orders []domain.Order, operations []domain.Operation, requireZeroCommission bool, commissionTolerance decimal.Decimal) []domain.ReconciliationDiff {
 	var diffs []domain.ReconciliationDiff
+	if commissionTolerance.IsNegative() {
+		commissionTolerance = decimal.Zero
+	}
 	localCommissionByInstrument := make(map[string]decimal.Decimal)
 	localTraded := make(map[string]bool)
 	for _, order := range orders {
@@ -192,7 +228,15 @@ func compareOperations(orders []domain.Order, operations []domain.Operation) []d
 	for instrumentUID := range instruments {
 		localCommission := localCommissionByInstrument[instrumentUID]
 		brokerCommission := brokerCommissionByInstrument[instrumentUID]
-		if diff := money.Abs(localCommission.Sub(brokerCommission)); diff.GreaterThan(decimal.NewFromFloat(0.01)) {
+		if requireZeroCommission && brokerCommission.IsPositive() {
+			diffs = append(diffs, domain.ReconciliationDiff{
+				Kind:          "actual_commission_nonzero",
+				InstrumentUID: instrumentUID,
+				Message:       fmt.Sprintf("broker commission=%s", brokerCommission.StringFixed(2)),
+				Critical:      true,
+			})
+		}
+		if diff := money.Abs(localCommission.Sub(brokerCommission)); diff.GreaterThan(commissionTolerance) {
 			diffs = append(diffs, domain.ReconciliationDiff{
 				Kind:          "commission_mismatch",
 				InstrumentUID: instrumentUID,
