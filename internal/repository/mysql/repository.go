@@ -356,7 +356,7 @@ INSERT INTO candles_minute (
   :instrument_uid, :trade_date, :open, :high, :low, :close, :volume_lots, :source, :loaded_at
 ) ON DUPLICATE KEY UPDATE
   open=VALUES(open), high=VALUES(high), low=VALUES(low), close=VALUES(close),
-  volume_lots=VALUES(volume_lots), source=VALUES(source), loaded_at=VALUES(loaded_at)`, candleRowFromDomain(candle))
+  volume_lots=VALUES(volume_lots), source=VALUES(source), loaded_at=VALUES(loaded_at)`, minuteCandleRowFromDomain(candle))
 		if err != nil {
 			return err
 		}

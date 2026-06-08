@@ -212,9 +212,6 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 				return Result{}, err
 			}
 			if ok {
-				if capacity := e.windowCapacity(candidate, preparedMinutes[instrumentUID]); capacity.IsPositive() {
-					candidate.capacity = capacity
-				}
 				candidatesByExitDate[candidate.exit.TradeDate.Format("2006-01-02")] = append(candidatesByExitDate[candidate.exit.TradeDate.Format("2006-01-02")], candidate)
 			}
 		}
@@ -251,20 +248,29 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 		dayStartEquity := equity
 		dayPnL := decimal.Zero
 		for _, c := range dayCandidates {
+			entryIntervalVolume, exitIntervalVolume := e.windowVolumes(c, preparedMinutes[c.instrumentUID])
+			capacity := decimal.Zero
+			if entryIntervalVolume.IsPositive() && exitIntervalVolume.IsPositive() {
+				capacity = money.Min(entryIntervalVolume, exitIntervalVolume).Mul(e.cfg.MaxParticipationRate)
+			} else if e.cfg.UseMinuteModel {
+				continue
+			} else {
+				entryIntervalVolume = e.unconstrainedIntervalVolume(equity)
+				exitIntervalVolume = entryIntervalVolume
+			}
 			sized := sizer.Size(risk.SizingInput{
 				Portfolio:           domain.Portfolio{Equity: equity, Cash: cash},
 				SelectedInstruments: len(dayCandidates),
 				LimitPrice:          c.buy,
 				Lot:                 c.lot,
-				EntryIntervalVolume: c.adv,
-				ExitIntervalVolume:  c.adv,
+				EntryIntervalVolume: entryIntervalVolume,
+				ExitIntervalVolume:  exitIntervalVolume,
 				Q05OvernightAbs:     c.q05Abs,
 			})
 			if sized.Lots <= 0 {
 				continue
 			}
 			lots := sized.Lots
-			capacity := c.capacity
 			if e.cfg.UseMinuteModel {
 				executedLots, minuteCapacity, ok := e.minuteExecution(c, preparedMinutes[c.instrumentUID], sized.Lots)
 				if !ok {
@@ -365,22 +371,34 @@ func (e Engine) fillableMinuteLots(minutes []domain.Candle, date time.Time, limi
 }
 
 func (e Engine) windowCapacity(c candidate, minutes []domain.Candle) decimal.Decimal {
-	if len(minutes) == 0 {
+	entryVolume, exitVolume := e.windowVolumes(c, minutes)
+	if !entryVolume.IsPositive() || !exitVolume.IsPositive() {
 		return decimal.Zero
+	}
+	return money.Min(entryVolume, exitVolume).Mul(e.cfg.MaxParticipationRate)
+}
+
+func (e Engine) windowVolumes(c candidate, minutes []domain.Candle) (decimal.Decimal, decimal.Decimal) {
+	if len(minutes) == 0 {
+		return decimal.Zero, decimal.Zero
 	}
 	lot := c.lot
 	if lot <= 0 {
 		lot = e.lotFor(c.instrumentUID)
 	}
 	if lot <= 0 {
-		return decimal.Zero
+		return decimal.Zero, decimal.Zero
 	}
 	entryVolume := e.windowNotional(minutes, c.entry.TradeDate, e.cfg.EntryWindow, lot)
 	exitVolume := e.windowNotional(minutes, c.exit.TradeDate, e.cfg.ExitWindow, lot)
-	if !entryVolume.IsPositive() || !exitVolume.IsPositive() {
+	return entryVolume, exitVolume
+}
+
+func (e Engine) unconstrainedIntervalVolume(equity decimal.Decimal) decimal.Decimal {
+	if !equity.IsPositive() || !e.cfg.MaxParticipationRate.IsPositive() {
 		return decimal.Zero
 	}
-	return money.Min(entryVolume, exitVolume).Mul(e.cfg.MaxParticipationRate)
+	return equity.Div(e.cfg.MaxParticipationRate).Mul(decimal.NewFromInt(10))
 }
 
 func (e Engine) windowNotional(minutes []domain.Candle, date time.Time, window TimeWindow, lot int64) decimal.Decimal {
@@ -421,7 +439,6 @@ type candidate struct {
 	adv           decimal.Decimal
 	q05Abs        decimal.Decimal
 	overnightGap  decimal.Decimal
-	capacity      decimal.Decimal
 	lot           int64
 }
 
@@ -507,7 +524,6 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 		adv:           adv,
 		q05Abs:        q05Abs,
 		overnightGap:  gap,
-		capacity:      adv.Mul(e.cfg.MaxParticipationRate),
 		lot:           lot,
 	}, true, nil
 }

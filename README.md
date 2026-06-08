@@ -10,7 +10,7 @@ make test
 APP_MODE=backtest go run ./cmd/bot
 ```
 
-Для daemon-режимов (`paper`, `sandbox`, `live_readonly`, `live_trade`) нужен `DB_DSN` MariaDB/MySQL. `live_trade` дополнительно требует `LIVE_TRADE_ACK=I_ACCEPT_RISK`.
+Для daemon-режимов (`paper`, `sandbox`, `live_readonly`, `live_trade`) нужен `DB_DSN` MariaDB/MySQL. `live_trade` дополнительно требует `LIVE_TRADE_ACK=I_ACCEPT_RISK` и выполненные pre-flight условия из секции `LIVE`.
 
 ## Environment Variables
 
@@ -168,6 +168,14 @@ APP_MODE=backtest go run ./cmd/bot
 | Переменная | Что указывать | Дефолт | Границы/валидация | За что отвечает и что меняется |
 | --- | --- | --- | --- | --- |
 | `LIVE_TRADE_ACK` | ровно `I_ACCEPT_RISK` | пусто | обязателен только для `APP_MODE=live_trade` | Ручное подтверждение риска для режима реальной торговли. Без него `live_trade` не стартует. |
+| `LIVE_READONLY_DAYS` | целое число торговых дней | `0` | для `live_trade` должно быть `>= 20` | Подтверждает накопленный период работы в `live_readonly` перед реальной торговлей. |
+| `LIVE_PAPER_DAYS` | целое число торговых дней | `0` | для `live_trade` должно быть `>= 20` | Подтверждает период `paper`-прогона с bid/ask моделью. |
+| `LIVE_SANDBOX_DAYS` | целое число торговых дней | `0` | для `live_trade` должно быть `>= 10` | Подтверждает период sandbox без критических ошибок. |
+| `LIVE_COMMISSION_WHITELIST_CHECKED` | `true` или `false` | `false` | для `live_trade` должно быть `true` | Ручное подтверждение актуальных комиссий и whitelist инструментов. |
+| `LIVE_TELEGRAM_TESTED` | `true` или `false` | `false` | для `live_trade` должно быть `true` | Подтверждает тест доставки Telegram-уведомлений. |
+| `LIVE_KILL_SWITCH_TESTED` | `true` или `false` | `false` | для `live_trade` должно быть `true` | Подтверждает тест ручного halt/unhalt сценария. |
+| `LIVE_SERVER_TIME_CHECKED` | `true` или `false` | `false` | для `live_trade` должно быть `true` | Подтверждает проверку server-time/drift в sandbox. |
+| `LIVE_SMALL_CAPITAL` | `true` или `false` | `false` | для `live_trade` должно быть `true` | Подтверждает запуск реальной торговли с малым стартовым капиталом. |
 
 ## Commands
 

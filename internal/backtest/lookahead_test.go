@@ -128,6 +128,27 @@ func TestWindowCapacityUsesMinuteEntryAndExitWindows(t *testing.T) {
 	}
 }
 
+func TestBacktestWithoutMinuteDataDoesNotReportADVAsCapacity(t *testing.T) {
+	engine := New(Config{
+		RollingShort:  2,
+		RollingLong:   2,
+		MinTStat60:    decimal.NewFromInt(-1),
+		MinWinRate60:  decimal.NewFromFloat(0.1),
+		MinNetEdgeBps: decimal.NewFromInt(-1000),
+		MinADVRUB:     decimal.NewFromInt(1),
+	})
+	result, err := engine.Run(map[string][]domain.Candle{"uid": candidateCandles("uid")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Trades) == 0 {
+		t.Fatal("expected daily-only minimal backtest trade")
+	}
+	if !result.Trades[0].CapacityRUB.IsZero() {
+		t.Fatalf("capacity=%s, want zero when minute windows are unavailable", result.Trades[0].CapacityRUB)
+	}
+}
+
 func TestLoadCandlesCSVWithMetadata(t *testing.T) {
 	raw := strings.NewReader(`instrument_uid,trade_date,open,high,low,close,volume_lots,lot,min_price_increment
 uid,2024-01-02,100,101,99,100,10,10,0.05

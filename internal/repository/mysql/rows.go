@@ -35,6 +35,20 @@ func candleRowFromDomain(candle domain.Candle) candleRow {
 	}
 }
 
+func minuteCandleRowFromDomain(candle domain.Candle) candleRow {
+	return candleRow{
+		InstrumentUID: candle.InstrumentUID,
+		TradeDate:     candle.TradeDate.UTC(),
+		Open:          candle.Open,
+		High:          candle.High,
+		Low:           candle.Low,
+		Close:         candle.Close,
+		VolumeLots:    candle.VolumeLots,
+		Source:        candle.Source,
+		LoadedAt:      candle.LoadedAt,
+	}
+}
+
 func (r candleRow) domain() domain.Candle {
 	return domain.Candle{
 		InstrumentUID: r.InstrumentUID,

@@ -149,6 +149,9 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 	lock := e.lockFor(order.InstrumentUID)
 	lock.Lock()
 	defer lock.Unlock()
+	if e.mode != domain.ModePaper && !e.mode.AllowsBrokerOrders() {
+		return order, ErrBrokerOrdersDisabled
+	}
 	if e.store != nil {
 		existing, err := e.findExisting(ctx, order)
 		if err != nil {
@@ -160,13 +163,6 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 	}
 	if e.mode == domain.ModePaper {
 		return e.placePaperLimit(ctx, order, freeOrderLimit)
-	}
-	if !e.mode.AllowsBrokerOrders() {
-		order.Status = domain.OrderStatusNew
-		if e.store != nil {
-			return order, e.store.UpsertOrder(ctx, order)
-		}
-		return order, ErrBrokerOrdersDisabled
 	}
 	if e.gateway == nil {
 		return domain.Order{}, errors.New("gateway is nil")
@@ -569,14 +565,22 @@ func (e *Engine) checkQuoteFresh(book domain.OrderBook) error {
 	if e.maxQuoteAge <= 0 {
 		return nil
 	}
-	if book.ReceivedAt.IsZero() {
-		return fmt.Errorf("quote received timestamp is missing")
+	quoteTs := quoteTimestamp(book)
+	if quoteTs.IsZero() {
+		return fmt.Errorf("quote timestamp is missing")
 	}
-	age := e.nowUTC().Sub(book.ReceivedAt)
+	age := e.nowUTC().Sub(quoteTs)
 	if age > e.maxQuoteAge {
 		return fmt.Errorf("quote age %s exceeds %s", age, e.maxQuoteAge)
 	}
 	return nil
+}
+
+func quoteTimestamp(book domain.OrderBook) time.Time {
+	if !book.Time.IsZero() {
+		return book.Time.UTC()
+	}
+	return book.ReceivedAt.UTC()
 }
 
 func (e *Engine) lockFor(instrumentUID string) *sync.Mutex {

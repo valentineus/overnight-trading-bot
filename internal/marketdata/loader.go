@@ -86,14 +86,22 @@ func (l Loader) LatestQuote(ctx context.Context, instrumentUID string, depth int
 	if err != nil {
 		return domain.OrderBook{}, err
 	}
-	if book.ReceivedAt.IsZero() {
-		return domain.OrderBook{}, fmt.Errorf("quote received timestamp is missing")
+	quoteTs := quoteTimestamp(book)
+	if quoteTs.IsZero() {
+		return domain.OrderBook{}, fmt.Errorf("quote timestamp is missing")
 	}
-	age := l.nowUTC().Sub(book.ReceivedAt)
+	age := l.nowUTC().Sub(quoteTs)
 	if maxAge > 0 && age > maxAge {
 		return domain.OrderBook{}, fmt.Errorf("quote age %s exceeds %s", age, maxAge)
 	}
 	return book, nil
+}
+
+func quoteTimestamp(book domain.OrderBook) time.Time {
+	if !book.Time.IsZero() {
+		return book.Time.UTC()
+	}
+	return book.ReceivedAt.UTC()
 }
 
 func (l Loader) nowUTC() time.Time {

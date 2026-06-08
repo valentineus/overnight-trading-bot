@@ -243,6 +243,52 @@ func TestPlaceEntryRejectsStaleQuote(t *testing.T) {
 	}
 }
 
+func TestPlaceEntryRejectsStaleExchangeQuoteTime(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 6, 8, 18, 20, 0, 0, time.UTC)
+	engine := NewEngine(domain.ModeSandbox, "account", tinvest.NewFakeGateway(), testutil.NewMemoryRepository())
+	engine.SetClock(&fixedClock{now: now})
+	engine.SetMaxQuoteAge(time.Second)
+	_, err := engine.PlaceEntry(ctx, "hash", domain.Instrument{
+		InstrumentUID:     "uid",
+		Lot:               1,
+		MinPriceIncrement: decimal.NewFromInt(1),
+	}, now, 1, domain.OrderBook{
+		InstrumentUID: "uid",
+		Time:          now.Add(-2 * time.Second),
+		ReceivedAt:    now,
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+	}, 1, 1)
+	if err == nil {
+		t.Fatal("expected stale exchange quote timestamp error")
+	}
+}
+
+func TestLiveReadonlyDoesNotPersistLocalOrder(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	engine := NewEngine(domain.ModeLiveReadonly, "account", tinvest.NewFakeGateway(), repo)
+	_, err := engine.PlaceLimit(ctx, domain.Order{
+		ClientOrderID: "readonly-order",
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		TradeDate:     time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC),
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    decimal.NewFromInt(100),
+		QuantityLots:  1,
+		Status:        domain.OrderStatusNew,
+		AttemptNo:     1,
+	})
+	if !errors.Is(err, ErrBrokerOrdersDisabled) {
+		t.Fatalf("PlaceLimit err=%v, want ErrBrokerOrdersDisabled", err)
+	}
+	if len(repo.Orders) != 0 {
+		t.Fatalf("readonly mode persisted orders: %+v", repo.Orders)
+	}
+}
+
 func TestMonitorUntilRepostsAndExpiresAtDeadline(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

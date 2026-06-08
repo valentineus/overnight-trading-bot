@@ -15,6 +15,12 @@ import (
 const liveTradeAck = "I_ACCEPT_RISK"
 const maxQuoteDepth = 50
 
+const (
+	minLiveReadonlyDays = 20
+	minPaperDays        = 20
+	minSandboxDays      = 10
+)
+
 type Config struct {
 	App        AppConfig        `envPrefix:"APP_"`
 	TInvest    TInvestConfig    `envPrefix:"TINVEST_"`
@@ -147,7 +153,15 @@ type BacktestConfig struct {
 }
 
 type LiveConfig struct {
-	TradeAck string `env:"TRADE_ACK"`
+	TradeAck                   string `env:"TRADE_ACK"`
+	ReadonlyDays               int    `env:"READONLY_DAYS" envDefault:"0"`
+	PaperDays                  int    `env:"PAPER_DAYS" envDefault:"0"`
+	SandboxDays                int    `env:"SANDBOX_DAYS" envDefault:"0"`
+	CommissionWhitelistChecked bool   `env:"COMMISSION_WHITELIST_CHECKED" envDefault:"false"`
+	TelegramTested             bool   `env:"TELEGRAM_TESTED" envDefault:"false"`
+	KillSwitchTested           bool   `env:"KILL_SWITCH_TESTED" envDefault:"false"`
+	ServerTimeChecked          bool   `env:"SERVER_TIME_CHECKED" envDefault:"false"`
+	SmallCapital               bool   `env:"SMALL_CAPITAL" envDefault:"false"`
 }
 
 func Load() (Config, error) {
@@ -236,8 +250,41 @@ func (c *Config) Validate() error {
 	if c.TInvest.UseSandbox && c.App.Mode != domain.ModeSandbox {
 		return errors.New("TINVEST_USE_SANDBOX=true is only valid with APP_MODE=sandbox")
 	}
-	if c.App.Mode == domain.ModeLiveTrade && c.Live.TradeAck != liveTradeAck {
-		return fmt.Errorf("LIVE_TRADE_ACK=%s is required for APP_MODE=live_trade", liveTradeAck)
+	if c.App.Mode == domain.ModeLiveTrade {
+		if c.Live.TradeAck != liveTradeAck {
+			return fmt.Errorf("LIVE_TRADE_ACK=%s is required for APP_MODE=live_trade", liveTradeAck)
+		}
+		if err := c.validateLiveTradePreconditions(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c Config) validateLiveTradePreconditions() error {
+	if c.Live.ReadonlyDays < minLiveReadonlyDays {
+		return fmt.Errorf("LIVE_READONLY_DAYS must be >= %d for APP_MODE=live_trade", minLiveReadonlyDays)
+	}
+	if c.Live.PaperDays < minPaperDays {
+		return fmt.Errorf("LIVE_PAPER_DAYS must be >= %d for APP_MODE=live_trade", minPaperDays)
+	}
+	if c.Live.SandboxDays < minSandboxDays {
+		return fmt.Errorf("LIVE_SANDBOX_DAYS must be >= %d for APP_MODE=live_trade", minSandboxDays)
+	}
+	if !c.Live.CommissionWhitelistChecked {
+		return errors.New("LIVE_COMMISSION_WHITELIST_CHECKED=true is required for APP_MODE=live_trade")
+	}
+	if !c.Live.TelegramTested {
+		return errors.New("LIVE_TELEGRAM_TESTED=true is required for APP_MODE=live_trade")
+	}
+	if !c.Live.KillSwitchTested {
+		return errors.New("LIVE_KILL_SWITCH_TESTED=true is required for APP_MODE=live_trade")
+	}
+	if !c.Live.ServerTimeChecked {
+		return errors.New("LIVE_SERVER_TIME_CHECKED=true is required for APP_MODE=live_trade")
+	}
+	if !c.Live.SmallCapital {
+		return errors.New("LIVE_SMALL_CAPITAL=true is required for APP_MODE=live_trade")
 	}
 	return nil
 }

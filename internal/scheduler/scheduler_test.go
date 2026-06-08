@@ -85,23 +85,98 @@ func TestPhaseHonorsExitNotBeforeWhenWindowStartsEarlier(t *testing.T) {
 	}
 }
 
-func TestInfrastructureOutageRequiresThreshold(t *testing.T) {
+func TestClockDriftHardLimitHaltsImmediately(t *testing.T) {
 	gateway := tinvest.NewFakeGateway()
 	gateway.ServerTime = time.Now().UTC().Add(-10 * time.Second)
+	repo := testutil.NewMemoryRepository()
+	notifier := &countNotifier{}
 	s := &Scheduler{
 		cfg: Config{
 			Mode:          domain.ModeSandbox,
 			MaxClockDrift: 2 * time.Second,
 			APIOutageHalt: 180 * time.Second,
 		},
-		svc: Services{Gateway: gateway},
+		svc: Services{
+			Gateway:  gateway,
+			Risk:     risk.NewManager(repo, risk.ManagerConfig{}),
+			Notifier: notifier,
+		},
 	}
-	if err := s.checkInfrastructure(context.Background()); err != nil {
-		t.Fatalf("first infrastructure failure should be tolerated: %v", err)
+	if err := s.checkInfrastructure(context.Background()); !errors.Is(err, statemachine.ErrSystemHalted) {
+		t.Fatalf("err=%v, want immediate halt on clock drift", err)
 	}
-	s.infraFailedSince = time.Now().UTC().Add(-181 * time.Second)
-	if err := s.checkInfrastructure(context.Background()); err == nil {
-		t.Fatalf("expected outage after threshold")
+	if !repo.Halted || repo.HaltReason == "" {
+		t.Fatalf("system was not halted: state=%s halted=%v reason=%q", repo.State, repo.Halted, repo.HaltReason)
+	}
+	if notifier.alerts != 1 {
+		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
+func TestStepIsIdempotentAfterSignalPreparation(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 8, 18, 15, 0, 0, time.UTC)
+	if err := repo.SaveSystemState(ctx, domain.StateWaitEntryWindow, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	s := Scheduler{
+		clock: fixedClock{now: now},
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			EntrySignalTime:  mustTOD("18:10:00"),
+			EntryWindowStart: mustTOD("18:20:00"),
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			Notifier:      &countNotifier{},
+			AccountIDHash: "hash",
+		},
+	}
+	if err := s.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+	state, halted, _, err := repo.GetSystemState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if halted || state != domain.StateWaitEntryWindow {
+		t.Fatalf("state=%s halted=%v, want WAIT_ENTRY_WINDOW without rollback", state, halted)
+	}
+}
+
+func TestStepMonitorsEntryOrdersOnRepeatedEntryWindowTick(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 8, 18, 25, 0, 0, time.UTC)
+	if err := repo.SaveSystemState(ctx, domain.StateMonitorEntryOrders, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	s := Scheduler{
+		clock: fixedClock{now: now},
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			EntryWindowStart: mustTOD("18:20:00"),
+			NoNewEntryAfter:  mustTOD("18:38:30"),
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			AccountIDHash: "hash",
+		},
+	}
+	if err := s.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+	state, halted, _, err := repo.GetSystemState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if halted || state != domain.StateMonitorEntryOrders {
+		t.Fatalf("state=%s halted=%v, want MONITOR_ENTRY_ORDERS", state, halted)
 	}
 }
 

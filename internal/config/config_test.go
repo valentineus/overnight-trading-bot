@@ -27,6 +27,23 @@ func TestValidateAllowsCancelCountsFreeOrderPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateLiveTradeRequiresPreconditions(t *testing.T) {
+	cfg := minimalBrokerConfig(domain.ModeLiveTrade)
+	cfg.Live.TradeAck = liveTradeAck
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "LIVE_READONLY_DAYS") {
+		t.Fatalf("Validate err=%v, want live_trade readonly precondition", err)
+	}
+}
+
+func TestValidateLiveTradeAcceptsAllPreconditions(t *testing.T) {
+	cfg := minimalBrokerConfig(domain.ModeLiveTrade)
+	cfg.Live = validLiveTradeConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate live_trade preconditions: %v", err)
+	}
+}
+
 func minimalBrokerConfig(mode domain.Mode) Config {
 	return Config{
 		App: AppConfig{
@@ -61,6 +78,20 @@ func minimalBrokerConfig(mode domain.Mode) Config {
 			CommissionToleranceRUB:    decimal.NewFromFloat(0.01),
 		},
 		Commission: CommissionConfig{FreeOrderCountPolicy: "submitted"},
+	}
+}
+
+func validLiveTradeConfig() LiveConfig {
+	return LiveConfig{
+		TradeAck:                   liveTradeAck,
+		ReadonlyDays:               minLiveReadonlyDays,
+		PaperDays:                  minPaperDays,
+		SandboxDays:                minSandboxDays,
+		CommissionWhitelistChecked: true,
+		TelegramTested:             true,
+		KillSwitchTested:           true,
+		ServerTimeChecked:          true,
+		SmallCapital:               true,
 	}
 }
 
