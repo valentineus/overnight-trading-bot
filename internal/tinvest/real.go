@@ -15,6 +15,7 @@ import (
 	"github.com/shopspring/decimal"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/logging"
@@ -407,6 +408,13 @@ func orderFromPostResponse(resp *pb.PostOrderResponse, accountID, clientOrderID 
 		return domain.Order{}
 	}
 	now := time.Now().UTC()
+	avgFillPrice := decimal.Zero
+	if resp.GetLotsExecuted() > 0 {
+		avgFillPrice = money.MoneyValueToDecimal(resp.GetExecutedOrderPrice())
+		if !avgFillPrice.IsPositive() {
+			avgFillPrice = limitPrice
+		}
+	}
 	return domain.Order{
 		ClientOrderID: clientOrderID,
 		BrokerOrderID: resp.GetOrderId(),
@@ -417,7 +425,7 @@ func orderFromPostResponse(resp *pb.PostOrderResponse, accountID, clientOrderID 
 		LimitPrice:    limitPrice,
 		QuantityLots:  resp.GetLotsRequested(),
 		FilledLots:    resp.GetLotsExecuted(),
-		AvgFillPrice:  limitPrice,
+		AvgFillPrice:  avgFillPrice,
 		Status:        mapOrderStatus(resp.GetExecutionReportStatus()),
 		Commission:    money.MoneyValueToDecimal(resp.GetExecutedCommission()),
 		RawStateJSON:  marshalProto(resp),
@@ -438,6 +446,10 @@ func orderFromState(state *pb.OrderState, accountID string) domain.Order {
 	if state.GetOrderDate() != nil {
 		orderDate = state.GetOrderDate().AsTime().UTC()
 	}
+	avgFillPrice := decimal.Zero
+	if state.GetLotsExecuted() > 0 {
+		avgFillPrice = money.MoneyValueToDecimal(state.GetAveragePositionPrice())
+	}
 	return domain.Order{
 		ClientOrderID: state.GetOrderRequestId(),
 		BrokerOrderID: state.GetOrderId(),
@@ -448,7 +460,7 @@ func orderFromState(state *pb.OrderState, accountID string) domain.Order {
 		LimitPrice:    money.MoneyValueToDecimal(state.GetInitialSecurityPrice()),
 		QuantityLots:  state.GetLotsRequested(),
 		FilledLots:    state.GetLotsExecuted(),
-		AvgFillPrice:  money.MoneyValueToDecimal(state.GetAveragePositionPrice()),
+		AvgFillPrice:  avgFillPrice,
 		Status:        mapOrderStatus(state.GetExecutionReportStatus()),
 		Commission:    money.MoneyValueToDecimal(state.GetExecutedCommission()),
 		RawStateJSON:  marshalProto(state),
@@ -478,10 +490,52 @@ func marshalProto(msg proto.Message) string {
 	if msg == nil {
 		return "{}"
 	}
-	raw, err := protojson.Marshal(msg)
+	sanitized := proto.Clone(msg)
+	clearSensitiveProtoFields(sanitized.ProtoReflect())
+	raw, err := protojson.Marshal(sanitized)
 	if err != nil {
 		fallback, _ := json.Marshal(map[string]string{"marshal_error": err.Error()})
 		return string(fallback)
 	}
 	return string(raw)
+}
+
+func clearSensitiveProtoFields(message protoreflect.Message) {
+	if !message.IsValid() {
+		return
+	}
+	fields := message.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		if isSensitiveProtoField(field.Name()) {
+			message.Clear(field)
+			continue
+		}
+		value := message.Get(field)
+		switch {
+		case field.IsList():
+			list := value.List()
+			if field.Kind() == protoreflect.MessageKind || field.Kind() == protoreflect.GroupKind {
+				for j := 0; j < list.Len(); j++ {
+					clearSensitiveProtoFields(list.Get(j).Message())
+				}
+			}
+		case field.IsMap():
+			if field.MapValue().Kind() == protoreflect.MessageKind || field.MapValue().Kind() == protoreflect.GroupKind {
+				value.Map().Range(func(_ protoreflect.MapKey, value protoreflect.Value) bool {
+					clearSensitiveProtoFields(value.Message())
+					return true
+				})
+			}
+		case field.Kind() == protoreflect.MessageKind || field.Kind() == protoreflect.GroupKind:
+			if message.Has(field) {
+				clearSensitiveProtoFields(value.Message())
+			}
+		}
+	}
+}
+
+func isSensitiveProtoField(name protoreflect.Name) bool {
+	normalized := strings.ReplaceAll(strings.ToLower(string(name)), "_", "")
+	return normalized == "accountid"
 }

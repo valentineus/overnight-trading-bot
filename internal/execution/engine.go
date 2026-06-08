@@ -17,6 +17,11 @@ import (
 var ErrBrokerOrdersDisabled = errors.New("broker orders are disabled for current mode")
 var ErrEmptyOrderBook = errors.New("order book has no usable bid/ask")
 
+const (
+	FreeOrderPolicySubmitted    = "submitted"
+	FreeOrderPolicyCancelCounts = "cancel_counts"
+)
+
 type Gateway interface {
 	PostLimitOrder(ctx context.Context, accountID, instrumentUID string, side domain.Side, lots int64, price decimal.Decimal, clientOrderID string) (domain.Order, error)
 	CancelOrder(ctx context.Context, accountID, orderID string) error
@@ -24,12 +29,13 @@ type Gateway interface {
 }
 
 type Engine struct {
-	mode        domain.Mode
-	accountID   string
-	gateway     Gateway
-	store       repository.Repository
-	maxQuoteAge time.Duration
-	mu          sync.Map
+	mode                 domain.Mode
+	accountID            string
+	gateway              Gateway
+	store                repository.Repository
+	maxQuoteAge          time.Duration
+	freeOrderCountPolicy string
+	mu                   sync.Map
 }
 
 type MonitorConfig struct {
@@ -44,11 +50,20 @@ type MonitorConfig struct {
 }
 
 func NewEngine(mode domain.Mode, accountID string, gateway Gateway, store repository.Repository) Engine {
-	return Engine{mode: mode, accountID: accountID, gateway: gateway, store: store}
+	return Engine{mode: mode, accountID: accountID, gateway: gateway, store: store, freeOrderCountPolicy: FreeOrderPolicySubmitted}
 }
 
 func (e *Engine) SetMaxQuoteAge(maxQuoteAge time.Duration) {
 	e.maxQuoteAge = maxQuoteAge
+}
+
+func (e *Engine) SetFreeOrderCountPolicy(policy string) {
+	switch policy {
+	case FreeOrderPolicyCancelCounts:
+		e.freeOrderCountPolicy = policy
+	default:
+		e.freeOrderCountPolicy = FreeOrderPolicySubmitted
+	}
 }
 
 func (e *Engine) PlaceEntry(ctx context.Context, accountIDHash string, instrument domain.Instrument, tradeDate time.Time, lots int64, book domain.OrderBook, improveTicks int, attempt int) (domain.Order, error) {
@@ -251,7 +266,15 @@ func (e *Engine) Cancel(ctx context.Context, order domain.Order) error {
 		return err
 	}
 	if e.store != nil {
-		return e.store.UpdateOrderStatus(ctx, order.ClientOrderID, domain.OrderStatusCancelled, order.FilledLots, order.RawStateJSON)
+		return e.store.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
+			if err := repo.UpdateOrderStatus(ctx, order.ClientOrderID, domain.OrderStatusCancelled, order.FilledLots, order.RawStateJSON); err != nil {
+				return err
+			}
+			if e.cancelCountsAsFreeOrder() {
+				return repo.IncrementFreeOrders(ctx, order.TradeDate, order.InstrumentUID, 1)
+			}
+			return nil
+		})
 	}
 	return nil
 }
@@ -485,10 +508,19 @@ func (e *Engine) ensureRepostBudget(ctx context.Context, order domain.Order, ins
 	if err != nil {
 		return err
 	}
-	if instrument.FreeOrderLimitPerDay-sent < 1 {
-		return fmt.Errorf("%w: %s remaining=0", risk.ErrFreeOrderBudget, instrument.InstrumentUID)
+	needed := 1
+	if e.cancelCountsAsFreeOrder() {
+		needed = 2
+	}
+	remaining := instrument.FreeOrderLimitPerDay - sent
+	if remaining < needed {
+		return fmt.Errorf("%w: %s remaining=%d needed=%d", risk.ErrFreeOrderBudget, instrument.InstrumentUID, remaining, needed)
 	}
 	return nil
+}
+
+func (e *Engine) cancelCountsAsFreeOrder() bool {
+	return e.freeOrderCountPolicy == FreeOrderPolicyCancelCounts
 }
 
 func (e *Engine) checkQuoteFresh(book domain.OrderBook) error {

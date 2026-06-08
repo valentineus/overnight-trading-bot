@@ -45,6 +45,7 @@ type Config struct {
 	EntryWindowEnd         timeutil.TimeOfDay
 	NoNewEntryAfter        timeutil.TimeOfDay
 	ExitWatchStart         timeutil.TimeOfDay
+	ExitNotBefore          timeutil.TimeOfDay
 	ExitWindowStart        timeutil.TimeOfDay
 	ExitWindowEnd          timeutil.TimeOfDay
 	HardExitDeadline       timeutil.TimeOfDay
@@ -60,6 +61,7 @@ type Config struct {
 	APIOutageHalt          time.Duration
 	RequireZeroCommission  bool
 	QuarantineOnNonZero    bool
+	FreeOrderCountPolicy   string
 	ReconciliationInterval time.Duration
 	MaxOpenPositions       int
 }
@@ -133,6 +135,13 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		return err
 	}
 	now := s.clock.Now().In(s.cfg.Location)
+	reported, err := s.sendMissedDailyReport(ctx, now)
+	if err != nil {
+		return err
+	}
+	if reported {
+		return nil
+	}
 	phase := s.phase(now)
 	switch phase {
 	case domain.StateWaitExitWindow:
@@ -158,10 +167,14 @@ func (s *Scheduler) Step(ctx context.Context) error {
 
 func (s Scheduler) phase(now time.Time) domain.SystemState {
 	tod := sinceMidnight(now)
+	exitWindowStart := s.cfg.ExitWindowStart.Duration
+	if s.cfg.ExitNotBefore.Duration > exitWindowStart {
+		exitWindowStart = s.cfg.ExitNotBefore.Duration
+	}
 	switch {
-	case tod >= s.cfg.ExitWatchStart.Duration && tod < s.cfg.ExitWindowStart.Duration:
+	case tod >= s.cfg.ExitWatchStart.Duration && tod < exitWindowStart:
 		return domain.StateWaitExitWindow
-	case tod >= s.cfg.ExitWindowStart.Duration && tod < s.cfg.ExitWindowEnd.Duration:
+	case tod >= exitWindowStart && tod < s.cfg.ExitWindowEnd.Duration:
 		return domain.StatePlaceExitOrders
 	case tod >= s.cfg.ExitWindowEnd.Duration && tod < s.cfg.HardExitDeadline.Duration:
 		return domain.StateMonitorExitOrders
@@ -463,7 +476,7 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 			}
 			continue
 		}
-		pre, err := s.preTradeCheck(ctx, now, portfolio, projectedOpenPositions, tradingStatus, book.ReceivedAt)
+		pre, err := s.preTradeCheck(ctx, now, sig.InstrumentUID, portfolio, projectedOpenPositions, tradingStatus, book.ReceivedAt)
 		if err != nil {
 			return err
 		}
@@ -585,7 +598,7 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		if !ok {
 			return fmt.Errorf("instrument %s is not in registry", pos.InstrumentUID)
 		}
-		if _, err := s.svc.FreeOrders.Check(ctx, exitTradeDate, instrument, s.cfg.MaxExitOrderAttempts); err != nil {
+		if _, err := s.svc.FreeOrders.Check(ctx, exitTradeDate, instrument, s.orderBudgetNeededForAttempts(s.cfg.MaxExitOrderAttempts)); err != nil {
 			if insertErr := s.recordPreTradeReject(ctx, pos.InstrumentUID, err.Error(), `{"reason":"free_order_budget_insufficient"}`); insertErr != nil {
 				return insertErr
 			}
@@ -609,7 +622,7 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return err
 		}
-		pre, err := s.preTradeCheck(ctx, now, portfolio, len(positionsList), tradingStatus, book.ReceivedAt)
+		pre, err := s.preTradeCheck(ctx, now, pos.InstrumentUID, portfolio, len(positionsList), tradingStatus, book.ReceivedAt)
 		if err != nil {
 			return err
 		}
@@ -722,10 +735,45 @@ func (s *Scheduler) reconcileAndReport(ctx context.Context, now time.Time) error
 	if err := s.transitionTo(ctx, domain.StateReconcile); err != nil {
 		return err
 	}
-	if err := s.reconcileCritical(ctx, "reconciliation_critical"); err != nil {
-		return err
+	if s.cfg.Mode.AllowsBrokerOrders() {
+		if err := s.reconcileCritical(ctx, "reconciliation_critical"); err != nil {
+			return err
+		}
 	}
 	return s.sendDailyReport(ctx, now, "ok")
+}
+
+func (s *Scheduler) sendMissedDailyReport(ctx context.Context, now time.Time) (bool, error) {
+	if s.svc.Repo == nil || !s.hasStateMachine() {
+		return false, nil
+	}
+	tod := sinceMidnight(now)
+	if tod < s.cfg.EntrySignalTime.Duration {
+		return false, nil
+	}
+	phase := s.phase(now)
+	if phase == domain.StateReconcile || phase == domain.StateReport {
+		return false, nil
+	}
+	state, halted, _, err := s.svc.Repo.GetSystemState(ctx)
+	if err != nil {
+		return false, err
+	}
+	if halted || state == domain.StateHalted {
+		return false, nil
+	}
+	if state != domain.StateInit && state != domain.StateSleep {
+		return false, nil
+	}
+	tradeDate := tradingDate(now)
+	sent, err := s.svc.Repo.WasDailyReportSent(ctx, tradeDate, s.svc.AccountIDHash)
+	if err != nil {
+		return false, err
+	}
+	if sent {
+		return false, nil
+	}
+	return true, s.reconcileAndReport(ctx, now)
 }
 
 func (s *Scheduler) sendDailyReport(ctx context.Context, now time.Time, riskStatus string) error {
@@ -1081,7 +1129,7 @@ func (s Scheduler) repostPreTradeCheck(ctx context.Context, now time.Time, order
 	if err != nil {
 		return err
 	}
-	pre, err := s.preTradeCheck(ctx, now, portfolio, len(openPositions), tradingStatus, book.ReceivedAt)
+	pre, err := s.preTradeCheck(ctx, now, order.InstrumentUID, portfolio, len(openPositions), tradingStatus, book.ReceivedAt)
 	if err != nil {
 		return err
 	}
@@ -1092,23 +1140,96 @@ func (s Scheduler) repostPreTradeCheck(ctx context.Context, now time.Time, order
 	return nil
 }
 
-func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, portfolio domain.Portfolio, openPositions int, tradingStatus domain.TradingStatus, quoteReceivedAt time.Time) (risk.PreTradeResult, error) {
+func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentUID string, portfolio domain.Portfolio, openPositions int, tradingStatus domain.TradingStatus, quoteReceivedAt time.Time) (risk.PreTradeResult, error) {
 	metrics, err := s.riskMetrics(ctx, now, portfolio)
+	if err != nil {
+		if haltErr := s.halt(ctx, "database_unavailable", fmt.Sprintf("pre-trade risk metrics unavailable: %s", err), instrumentUID); haltErr != nil {
+			return risk.PreTradeResult{}, fmt.Errorf("database_unavailable: %w; halt failed: %v", err, haltErr)
+		}
+		return risk.PreTradeResult{Allowed: false, Reason: "database_unavailable"}, fmt.Errorf("%w: database_unavailable", statemachine.ErrSystemHalted)
+	}
+	unknownOrder, unknownHolding, err := s.unknownBrokerState(ctx, portfolio)
 	if err != nil {
 		return risk.PreTradeResult{}, err
 	}
-	return s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
-		Portfolio:          portfolio,
-		OpenPositions:      openPositions,
-		DailyPnL:           metrics.dailyPnL,
-		WeeklyPnL:          metrics.weeklyPnL,
-		MonthlyDrawdownPct: metrics.monthlyDrawdownPct,
-		AvgSlippageBps10:   metrics.avgSlippageBps10,
-		TradingStatus:      tradingStatus,
-		QuoteReceivedAt:    quoteReceivedAt,
-		Now:                now.UTC(),
-		MarketClose:        s.marketCloseOn(now),
-	}), nil
+	result := s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
+		Portfolio:            portfolio,
+		OpenPositions:        openPositions,
+		DailyPnL:             metrics.dailyPnL,
+		WeeklyPnL:            metrics.weeklyPnL,
+		MonthlyDrawdownPct:   metrics.monthlyDrawdownPct,
+		AvgSlippageBps10:     metrics.avgSlippageBps10,
+		TradingStatus:        tradingStatus,
+		QuoteReceivedAt:      quoteReceivedAt,
+		Now:                  now.UTC(),
+		MarketClose:          s.marketCloseOn(now),
+		UnknownBrokerOrder:   unknownOrder,
+		UnknownBrokerHolding: unknownHolding,
+	})
+	if !result.Allowed && isHardHaltPreTradeReason(result.Reason) {
+		if err := s.halt(ctx, result.Reason, fmt.Sprintf("pre-trade hard limit breached: %s", result.Reason), instrumentUID); err != nil {
+			return result, err
+		}
+		return result, fmt.Errorf("%w: %s", statemachine.ErrSystemHalted, result.Reason)
+	}
+	return result, nil
+}
+
+func (s Scheduler) unknownBrokerState(ctx context.Context, portfolio domain.Portfolio) (bool, bool, error) {
+	if !s.cfg.Mode.AllowsBrokerOrders() {
+		return false, false, nil
+	}
+	localOrders, err := s.svc.Repo.ListActiveOrders(ctx, s.svc.AccountIDHash)
+	if err != nil {
+		return false, false, err
+	}
+	localByBroker := make(map[string]struct{}, len(localOrders))
+	for _, order := range localOrders {
+		if order.BrokerOrderID != "" {
+			localByBroker[order.BrokerOrderID] = struct{}{}
+		}
+	}
+	brokerOrders, err := s.svc.Gateway.GetActiveOrders(ctx, s.svc.AccountID)
+	if err != nil {
+		return false, false, err
+	}
+	for _, brokerOrder := range brokerOrders {
+		if brokerOrder.BrokerOrderID == "" {
+			continue
+		}
+		if _, ok := localByBroker[brokerOrder.BrokerOrderID]; !ok {
+			return true, false, nil
+		}
+	}
+	localPositions, err := s.svc.Repo.ListOpenPositions(ctx, s.svc.AccountIDHash)
+	if err != nil {
+		return false, false, err
+	}
+	localLots := make(map[string]int64, len(localPositions))
+	for _, pos := range localPositions {
+		localLots[pos.InstrumentUID] += pos.Lots
+	}
+	for _, holding := range portfolio.Holdings {
+		if holding.QuantityLots > 0 && localLots[holding.InstrumentUID] == 0 {
+			return false, true, nil
+		}
+	}
+	return false, false, nil
+}
+
+func isHardHaltPreTradeReason(reason string) bool {
+	switch reason {
+	case "database_unavailable",
+		"unknown_broker_order",
+		"unknown_broker_position",
+		"trading_status_unknown_before_order",
+		"max_daily_loss",
+		"max_weekly_loss",
+		"max_monthly_drawdown":
+		return true
+	default:
+		return false
+	}
 }
 
 type preTradeMetrics struct {
@@ -1255,9 +1376,20 @@ func repostAfter(now, deadline time.Time, attempts int, poll time.Duration) time
 }
 
 func (s Scheduler) maxOrderAttemptsPerTrade() int {
-	needed := s.cfg.MaxEntryOrderAttempts + s.cfg.MaxExitOrderAttempts
+	needed := s.orderBudgetNeededForAttempts(s.cfg.MaxEntryOrderAttempts) + s.orderBudgetNeededForAttempts(s.cfg.MaxExitOrderAttempts)
 	if needed <= 0 {
 		return 1
+	}
+	return needed
+}
+
+func (s Scheduler) orderBudgetNeededForAttempts(attempts int) int {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	needed := attempts
+	if s.cfg.FreeOrderCountPolicy == execution.FreeOrderPolicyCancelCounts {
+		needed += attempts - 1
 	}
 	return needed
 }

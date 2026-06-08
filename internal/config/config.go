@@ -68,14 +68,15 @@ type TelegramConfig struct {
 }
 
 type StrategyConfig struct {
-	RollingShort  int             `env:"ROLLING_SHORT" envDefault:"60"`
-	RollingLong   int             `env:"ROLLING_LONG" envDefault:"252"`
-	EWMALambda    float64         `env:"EWMA_LAMBDA" envDefault:"0.08"`
-	MinTStat60    decimal.Decimal `env:"MIN_TSTAT_60" envDefault:"1.25"`
-	MinWinRate60  decimal.Decimal `env:"MIN_WIN_RATE_60" envDefault:"0.55"`
-	MinNetEdgeBps decimal.Decimal `env:"MIN_NET_EDGE_BPS" envDefault:"10"`
-	RiskBufferBps decimal.Decimal `env:"RISK_BUFFER_BPS" envDefault:"5"`
-	MaxPositions  int             `env:"MAX_POSITIONS" envDefault:"5"`
+	RollingShort     int             `env:"ROLLING_SHORT" envDefault:"60"`
+	RollingLong      int             `env:"ROLLING_LONG" envDefault:"252"`
+	EWMALambda       float64         `env:"EWMA_LAMBDA" envDefault:"0.08"`
+	AllocationMethod string          `env:"ALLOCATION_METHOD" envDefault:"equal_weight"`
+	MinTStat60       decimal.Decimal `env:"MIN_TSTAT_60" envDefault:"1.25"`
+	MinWinRate60     decimal.Decimal `env:"MIN_WIN_RATE_60" envDefault:"0.55"`
+	MinNetEdgeBps    decimal.Decimal `env:"MIN_NET_EDGE_BPS" envDefault:"10"`
+	RiskBufferBps    decimal.Decimal `env:"RISK_BUFFER_BPS" envDefault:"5"`
+	MaxPositions     int             `env:"MAX_POSITIONS" envDefault:"5"`
 }
 
 type ExecutionConfig struct {
@@ -203,8 +204,19 @@ func (c *Config) Validate() error {
 	if c.Risk.CommissionToleranceRUB.IsNegative() {
 		return errors.New("RISK_COMMISSION_TOLERANCE_RUB must be non-negative")
 	}
-	if c.Commission.FreeOrderCountPolicy != "submitted" {
-		return fmt.Errorf("COMM_FREE_ORDER_COUNT_POLICY must be submitted, got %q", c.Commission.FreeOrderCountPolicy)
+	if c.Commission.FreeOrderCountPolicy == "" {
+		c.Commission.FreeOrderCountPolicy = "submitted"
+	}
+	switch c.Commission.FreeOrderCountPolicy {
+	case "submitted", "cancel_counts":
+	default:
+		return fmt.Errorf("COMM_FREE_ORDER_COUNT_POLICY must be submitted or cancel_counts, got %q", c.Commission.FreeOrderCountPolicy)
+	}
+	if c.Strategy.AllocationMethod == "" {
+		c.Strategy.AllocationMethod = "equal_weight"
+	}
+	if c.Strategy.AllocationMethod != "equal_weight" {
+		return fmt.Errorf("STRATEGY_ALLOCATION_METHOD must be equal_weight, got %q", c.Strategy.AllocationMethod)
 	}
 	if err := c.validateWindows(); err != nil {
 		return err

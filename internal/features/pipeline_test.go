@@ -1,12 +1,14 @@
 package features
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/shopspring/decimal"
 
 	"overnight-trading-bot/internal/domain"
+	"overnight-trading-bot/internal/testutil"
 	"overnight-trading-bot/internal/timeutil"
 )
 
@@ -71,6 +73,41 @@ func TestAverageIntervalVolumeUsesExecutionWindowsAcrossDays(t *testing.T) {
 	got := AverageIntervalVolume(candles, 1, window, loc)
 	if !got.Equal(decimal.NewFromInt(1500)) {
 		t.Fatalf("average interval volume=%s, want 1500", got)
+	}
+}
+
+func TestRecomputeExcludesTradeDateDailyCandle(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	var candles []domain.Candle
+	for i := 0; i < 6; i++ {
+		closePrice := decimal.NewFromInt(100)
+		if i == 5 {
+			closePrice = decimal.NewFromInt(100000)
+		}
+		candles = append(candles, domain.Candle{
+			InstrumentUID: "uid",
+			TradeDate:     start.AddDate(0, 0, i),
+			Open:          decimal.NewFromInt(100),
+			Close:         closePrice,
+			VolumeLots:    decimal.NewFromInt(1),
+		})
+	}
+	if err := repo.UpsertDailyCandles(ctx, candles); err != nil {
+		t.Fatal(err)
+	}
+	pipeline := NewPipeline(repo, PipelineConfig{
+		RollingShort: 2,
+		RollingLong:  2,
+		EWMALambda:   0.08,
+	})
+	got, err := pipeline.Recompute(ctx, domain.Instrument{InstrumentUID: "uid", Lot: 1}, start.AddDate(0, 0, 5), SpreadResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ADV20.Equal(decimal.NewFromInt(100)) {
+		t.Fatalf("ADV20=%s, want tradeDate candle excluded", got.ADV20)
 	}
 }
 

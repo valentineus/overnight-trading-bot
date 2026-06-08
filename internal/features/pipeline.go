@@ -40,7 +40,8 @@ func NewPipeline(repo repository.Repository, cfg PipelineConfig) Pipeline {
 
 func (p Pipeline) Recompute(ctx context.Context, instrument domain.Instrument, tradeDate time.Time, spread SpreadResult) (domain.FeatureSet, error) {
 	from := tradeDate.AddDate(0, 0, -p.cfg.RollingLong-5)
-	candles, err := p.repo.ListDailyCandles(ctx, instrument.InstrumentUID, from, tradeDate)
+	to := dateOnly(tradeDate).AddDate(0, 0, -1)
+	candles, err := p.repo.ListDailyCandles(ctx, instrument.InstrumentUID, from, to)
 	if err != nil {
 		return domain.FeatureSet{}, err
 	}
@@ -74,8 +75,9 @@ func (p Pipeline) intervalVolume(ctx context.Context, instrument domain.Instrume
 	if lookback <= 0 {
 		lookback = defaultIntervalVolumeLookback
 	}
-	from := window.Start.On(date.AddDate(0, 0, -lookback), loc).UTC()
-	to := window.End.On(date, loc).UTC()
+	toDate := dateOnly(date).AddDate(0, 0, -1)
+	from := window.Start.On(toDate.AddDate(0, 0, -lookback+1), loc).UTC()
+	to := window.End.On(toDate, loc).UTC()
 	candles, err := p.repo.ListMinuteCandles(ctx, instrument.InstrumentUID, from, to)
 	if err != nil {
 		return decimal.Zero, err
@@ -84,6 +86,7 @@ func (p Pipeline) intervalVolume(ctx context.Context, instrument domain.Instrume
 }
 
 func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate time.Time, spread SpreadResult, cfg PipelineConfig, entryVolume, exitVolume decimal.Decimal) (domain.FeatureSet, error) {
+	candles = historicalDailyCandles(candles, tradeDate)
 	if len(candles) < 2 {
 		return domain.FeatureSet{}, fmt.Errorf("need at least 2 candles, got %d", len(candles))
 	}
@@ -136,6 +139,22 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 		ExitIntervalVolume:  exitVolume,
 		CalculatedAt:        time.Now().UTC(),
 	}, nil
+}
+
+func historicalDailyCandles(candles []domain.Candle, tradeDate time.Time) []domain.Candle {
+	tradeDay := dateOnly(tradeDate)
+	out := make([]domain.Candle, 0, len(candles))
+	for _, candle := range candles {
+		if dateOnly(candle.TradeDate).Before(tradeDay) {
+			out = append(out, candle)
+		}
+	}
+	return out
+}
+
+func dateOnly(ts time.Time) time.Time {
+	year, month, day := ts.UTC().Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 }
 
 func IntervalVolume(candles []domain.Candle, lot int64) decimal.Decimal {

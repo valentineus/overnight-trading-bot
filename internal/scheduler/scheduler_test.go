@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -54,6 +55,33 @@ func TestPhaseUsesMoscowWindows(t *testing.T) {
 				t.Fatalf("phase=%s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPhaseHonorsExitNotBeforeWhenWindowStartsEarlier(t *testing.T) {
+	loc := time.FixedZone("MSK", 3*60*60)
+	s := Scheduler{cfg: Config{
+		Location:         loc,
+		EntrySignalTime:  mustTOD("18:10:00"),
+		ExitWatchStart:   mustTOD("09:50:00"),
+		ExitNotBefore:    mustTOD("10:03:00"),
+		ExitWindowStart:  mustTOD("10:00:00"),
+		ExitWindowEnd:    mustTOD("10:25:00"),
+		HardExitDeadline: mustTOD("10:45:00"),
+	}}
+	at, err := time.Parse(time.RFC3339, "2026-06-06T10:01:00+03:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.phase(at.In(loc)); got != domain.StateWaitExitWindow {
+		t.Fatalf("phase before ExitNotBefore=%s, want WAIT_EXIT_WINDOW", got)
+	}
+	at, err = time.Parse(time.RFC3339, "2026-06-06T10:04:00+03:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.phase(at.In(loc)); got != domain.StatePlaceExitOrders {
+		t.Fatalf("phase after ExitNotBefore=%s, want PLACE_EXIT_ORDERS", got)
 	}
 }
 
@@ -257,6 +285,80 @@ func TestNonZeroCommissionQuarantinesInstrumentAndHalts(t *testing.T) {
 	}
 	if notifier.alerts != 1 {
 		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
+func TestPreTradeDailyLossBreachHalts(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 8, 18, 20, 0, 0, time.UTC)
+	closedAt := now.Add(-time.Hour)
+	if err := repo.UpsertPosition(ctx, domain.Position{
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		OpenTradeDate: tradingDate(now),
+		Status:        domain.PositionExitFilled,
+		NetPnL:        decimal.NewFromInt(-200),
+		ClosedAt:      &closedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &countNotifier{}
+	s := Scheduler{
+		cfg: Config{Mode: domain.ModePaper, Location: time.UTC},
+		svc: Services{
+			Repo:          repo,
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{MaxDailyLossPct: decimal.RequireFromString("0.01")}),
+			Notifier:      notifier,
+			AccountIDHash: "hash",
+		},
+	}
+	_, err := s.preTradeCheck(ctx, now, "uid", domain.Portfolio{
+		Equity: decimal.NewFromInt(10000),
+		Cash:   decimal.NewFromInt(10000),
+	}, 0, domain.TradingStatusNormal, now)
+	if !errors.Is(err, statemachine.ErrSystemHalted) {
+		t.Fatalf("err=%v, want ErrSystemHalted", err)
+	}
+	if !repo.Halted || repo.HaltReason != "pre-trade hard limit breached: max_daily_loss" {
+		t.Fatalf("halted=%v reason=%q", repo.Halted, repo.HaltReason)
+	}
+	if notifier.alerts != 1 {
+		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
+func TestStepSendsMissedDailyReportAfterEntrySignalTime(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	notifier := &countNotifier{}
+	now := time.Date(2026, 6, 8, 18, 15, 0, 0, time.UTC)
+	s := Scheduler{
+		clock: fixedClock{now: now},
+		cfg: Config{
+			Mode:            domain.ModePaper,
+			Location:        time.UTC,
+			EntrySignalTime: mustTOD("18:10:00"),
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			Notifier:      notifier,
+			AccountIDHash: "hash",
+		},
+	}
+	if err := s.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if notifier.reports != 1 {
+		t.Fatalf("reports=%d, want catch-up report", notifier.reports)
+	}
+	sent, err := repo.WasDailyReportSent(ctx, now, "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sent {
+		t.Fatal("daily report was not marked as sent")
 	}
 }
 

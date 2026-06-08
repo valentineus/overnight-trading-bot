@@ -96,6 +96,40 @@ func TestPaperPlaceEntryFillsAndCountsSubmittedOrder(t *testing.T) {
 	}
 }
 
+func TestCancelCountsAsFreeOrderWhenPolicyEnabled(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	engine.SetFreeOrderCountPolicy(FreeOrderPolicyCancelCounts)
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order, err := engine.PlaceLimit(ctx, domain.Order{
+		ClientOrderID: "order-1",
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		TradeDate:     tradeDate,
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    decimal.NewFromInt(100),
+		QuantityLots:  1,
+		Status:        domain.OrderStatusNew,
+		AttemptNo:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Cancel(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := repo.GetFreeOrdersSent(ctx, tradeDate, "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 2 {
+		t.Fatalf("free order counter=%d, want submit+cancel", sent)
+	}
+}
+
 func TestPlaceEntryRejectsStaleQuote(t *testing.T) {
 	ctx := context.Background()
 	engine := NewEngine(domain.ModeSandbox, "account", tinvest.NewFakeGateway(), testutil.NewMemoryRepository())

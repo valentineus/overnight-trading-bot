@@ -170,3 +170,37 @@ func TestReconciliationSkipsFreshInFlightLocalOrders(t *testing.T) {
 		}
 	}
 }
+
+func TestReconciliationFindsCashMismatch(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	if err := repo.UpsertPosition(ctx, domain.Position{
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		OpenTradeDate: time.Now().UTC(),
+		Lots:          2,
+		Status:        domain.PositionHoldingOvernight,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Portfolio = domain.Portfolio{
+		Equity: decimal.NewFromInt(1000),
+		Cash:   decimal.NewFromInt(700),
+		Holdings: []domain.Holding{{
+			InstrumentUID: "uid",
+			QuantityLots:  2,
+			MarketValue:   decimal.NewFromInt(200),
+		}},
+	}
+	diffs, err := New(repo, gateway, "account", "hash").Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, diff := range diffs {
+		if diff.Kind == "cash_mismatch" && diff.Critical {
+			return
+		}
+	}
+	t.Fatalf("missing cash_mismatch in %+v", diffs)
+}

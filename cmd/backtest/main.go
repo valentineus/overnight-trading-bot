@@ -130,7 +130,7 @@ func run() error {
 		MaxSpreadBps:           spread,
 		MaxTickBps:             tick,
 		AssumedSpreadBps:       assumed,
-		RequireZeroCommission:  *requireZeroCommission,
+		RequireZeroCommission:  requireZeroCommission,
 		UseMinuteModel:         *useMinuteModel,
 	})
 	result, err := engine.RunWithMinuteCandles(candles, minuteCandles)

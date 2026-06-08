@@ -80,7 +80,7 @@ func TestCalendarRecoveryAllowsRestartInsideExitWindow(t *testing.T) {
 func TestRecoverFromMonitorEntryHaltsOnCriticalReconciliationDiff(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
-	if err := repo.SaveSystemState(ctx, domain.StateMonitorEntryOrders, domain.ModePaper, false, "", "{}"); err != nil {
+	if err := repo.SaveSystemState(ctx, domain.StateMonitorEntryOrders, domain.ModeSandbox, false, "", "{}"); err != nil {
 		t.Fatal(err)
 	}
 	if err := repo.UpsertOrder(ctx, domain.Order{
@@ -97,7 +97,7 @@ func TestRecoverFromMonitorEntryHaltsOnCriticalReconciliationDiff(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	system := New(repo, domain.ModePaper)
+	system := New(repo, domain.ModeSandbox)
 	state, err := system.Recover(ctx, reconciliation.New(repo, tinvest.NewFakeGateway(), "account", "hash"))
 	if err == nil {
 		t.Fatal("expected critical reconciliation error")

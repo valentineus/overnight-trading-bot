@@ -19,6 +19,14 @@ func TestValidateRequiresAccountIDForBrokerModes(t *testing.T) {
 	}
 }
 
+func TestValidateAllowsCancelCountsFreeOrderPolicy(t *testing.T) {
+	cfg := minimalBrokerConfig(domain.ModeSandbox)
+	cfg.Commission.FreeOrderCountPolicy = "cancel_counts"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate cancel_counts: %v", err)
+	}
+}
+
 func minimalBrokerConfig(mode domain.Mode) Config {
 	return Config{
 		App: AppConfig{
@@ -44,6 +52,7 @@ func minimalBrokerConfig(mode domain.Mode) Config {
 			QuoteDepth:          20,
 			OrderPollIntervalMS: 500,
 		},
+		Strategy: StrategyConfig{AllocationMethod: "equal_weight"},
 		Risk: RiskConfig{
 			APIOutageHaltSec:          180,
 			ReconciliationWindowHours: 72,

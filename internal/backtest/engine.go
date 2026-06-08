@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -19,35 +20,40 @@ import (
 )
 
 type Config struct {
-	EntrySlippageBps       decimal.Decimal
-	ExitSlippageBps        decimal.Decimal
-	CommissionRoundtripBps decimal.Decimal
-	RiskBufferBps          decimal.Decimal
-	InitialEquity          decimal.Decimal
-	OutputDir              string
-	RollingShort           int
-	RollingLong            int
-	EWMALambda             float64
-	MinTStat60             decimal.Decimal
-	MinWinRate60           decimal.Decimal
-	MinNetEdgeBps          decimal.Decimal
-	MinADVRUB              decimal.Decimal
-	MaxSpreadBps           decimal.Decimal
-	MaxTickBps             decimal.Decimal
-	RequireZeroCommission  bool
-	MaxPositions           int
-	MaxPositionPct         decimal.Decimal
-	MaxTotalExposurePct    decimal.Decimal
-	MaxParticipationRate   decimal.Decimal
-	CashUsageBuffer        decimal.Decimal
-	RiskBudgetPct          decimal.Decimal
-	MinOrderNotionalRUB    decimal.Decimal
-	AssumedSpreadBps       decimal.Decimal
-	AssumedTickBps         decimal.Decimal
-	Lot                    int64
-	UseMinuteModel         bool
-	EntryWindow            TimeWindow
-	ExitWindow             TimeWindow
+	EntrySlippageBps           decimal.Decimal
+	ExitSlippageBps            decimal.Decimal
+	CommissionRoundtripBps     decimal.Decimal
+	RiskBufferBps              decimal.Decimal
+	InitialEquity              decimal.Decimal
+	OutputDir                  string
+	RollingShort               int
+	RollingLong                int
+	EWMALambda                 float64
+	MinTStat60                 decimal.Decimal
+	MinWinRate60               decimal.Decimal
+	MinNetEdgeBps              decimal.Decimal
+	MinADVRUB                  decimal.Decimal
+	MaxSpreadBps               decimal.Decimal
+	MaxSpreadBpsMoneyMarket    decimal.Decimal
+	MaxSpreadBpsBondFunds      decimal.Decimal
+	MaxSpreadBpsEquityFunds    decimal.Decimal
+	MaxTickBps                 decimal.Decimal
+	RequireZeroCommission      *bool
+	MaxPositions               int
+	MaxPositionPct             decimal.Decimal
+	MaxTotalExposurePct        decimal.Decimal
+	MaxParticipationRate       decimal.Decimal
+	CashUsageBuffer            decimal.Decimal
+	RiskBudgetPct              decimal.Decimal
+	MinOrderNotionalRUB        decimal.Decimal
+	AssumedSpreadBps           decimal.Decimal
+	AssumedSpreadBpsByFundType map[string]decimal.Decimal
+	InstrumentFundTypes        map[string]string
+	AssumedTickBps             decimal.Decimal
+	Lot                        int64
+	UseMinuteModel             bool
+	EntryWindow                TimeWindow
+	ExitWindow                 TimeWindow
 }
 
 type TimeWindow struct {
@@ -120,6 +126,15 @@ func (cfg Config) withDefaults() Config {
 	if cfg.MaxSpreadBps.IsZero() {
 		cfg.MaxSpreadBps = decimal.NewFromInt(20)
 	}
+	if cfg.MaxSpreadBpsMoneyMarket.IsZero() {
+		cfg.MaxSpreadBpsMoneyMarket = decimal.NewFromInt(5)
+	}
+	if cfg.MaxSpreadBpsBondFunds.IsZero() {
+		cfg.MaxSpreadBpsBondFunds = decimal.NewFromInt(10)
+	}
+	if cfg.MaxSpreadBpsEquityFunds.IsZero() {
+		cfg.MaxSpreadBpsEquityFunds = decimal.NewFromInt(25)
+	}
 	if cfg.MaxTickBps.IsZero() {
 		cfg.MaxTickBps = decimal.NewFromInt(10)
 	}
@@ -132,8 +147,9 @@ func (cfg Config) withDefaults() Config {
 	if cfg.AssumedTickBps.IsZero() {
 		cfg.AssumedTickBps = cfg.MaxTickBps
 	}
-	if !cfg.RequireZeroCommission && cfg.CommissionRoundtripBps.IsZero() {
-		cfg.RequireZeroCommission = true
+	if cfg.RequireZeroCommission == nil {
+		requireZero := true
+		cfg.RequireZeroCommission = &requireZero
 	}
 	if cfg.MaxPositions == 0 {
 		cfg.MaxPositions = 5
@@ -260,7 +276,7 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 				Lots:          lots,
 				Notional:      notional,
 				NetPnL:        pnl,
-				SpreadBps:     e.cfg.AssumedSpreadBps,
+				SpreadBps:     c.spreadBps,
 				SlippageBps:   e.cfg.EntrySlippageBps.Add(e.cfg.ExitSlippageBps),
 				OvernightGap:  c.overnightGap,
 				CapacityRUB:   capacity,
@@ -355,6 +371,7 @@ type candidate struct {
 	buy           decimal.Decimal
 	sell          decimal.Decimal
 	netEdge       decimal.Decimal
+	spreadBps     decimal.Decimal
 	adv           decimal.Decimal
 	q05Abs        decimal.Decimal
 	overnightGap  decimal.Decimal
@@ -381,7 +398,8 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 		return candidate{}, false, nil
 	}
 	rawEdge := decimal.NewFromFloat(short.Mean).Mul(decimal.NewFromInt(10_000))
-	cost := e.cfg.AssumedSpreadBps.
+	spreadBps := e.assumedSpreadBps(instrumentUID)
+	cost := spreadBps.
 		Add(e.cfg.EntrySlippageBps).
 		Add(e.cfg.ExitSlippageBps).
 		Add(e.cfg.CommissionRoundtripBps).
@@ -389,7 +407,7 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 	netEdge := rawEdge.Sub(cost)
 	adv := features.ADV(history, e.cfg.Lot, 20)
 	switch {
-	case e.cfg.RequireZeroCommission && e.cfg.CommissionRoundtripBps.IsPositive():
+	case e.requireZeroCommission() && e.cfg.CommissionRoundtripBps.IsPositive():
 		return candidate{}, false, nil
 	case !decimal.NewFromFloat(short.Mean).IsPositive() || !decimal.NewFromFloat(long.Mean).IsPositive():
 		return candidate{}, false, nil
@@ -399,7 +417,7 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 		return candidate{}, false, nil
 	case netEdge.LessThan(e.cfg.MinNetEdgeBps):
 		return candidate{}, false, nil
-	case e.cfg.AssumedSpreadBps.GreaterThan(e.cfg.MaxSpreadBps):
+	case spreadBps.GreaterThan(e.maxSpreadBps(instrumentUID)):
 		return candidate{}, false, nil
 	case e.cfg.AssumedTickBps.GreaterThan(e.cfg.MaxTickBps):
 		return candidate{}, false, nil
@@ -425,11 +443,64 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 		buy:           buy,
 		sell:          sell,
 		netEdge:       netEdge,
+		spreadBps:     spreadBps,
 		adv:           adv,
 		q05Abs:        q05Abs,
 		overnightGap:  gap,
 		capacity:      adv.Mul(e.cfg.MaxParticipationRate),
 	}, true, nil
+}
+
+func (e Engine) requireZeroCommission() bool {
+	return e.cfg.RequireZeroCommission != nil && *e.cfg.RequireZeroCommission
+}
+
+func (e Engine) assumedSpreadBps(instrumentUID string) decimal.Decimal {
+	fundType := normalizedFundType(e.cfg.InstrumentFundTypes[instrumentUID])
+	if !fundType.IsZeroValue {
+		if spread, ok := e.cfg.AssumedSpreadBpsByFundType[fundType.Key]; ok {
+			return spread
+		}
+		return e.maxSpreadBpsForFundType(fundType.Raw)
+	}
+	return e.cfg.AssumedSpreadBps
+}
+
+func (e Engine) maxSpreadBps(instrumentUID string) decimal.Decimal {
+	fundType := normalizedFundType(e.cfg.InstrumentFundTypes[instrumentUID])
+	if fundType.IsZeroValue {
+		return e.cfg.MaxSpreadBps
+	}
+	return e.maxSpreadBpsForFundType(fundType.Raw)
+}
+
+func (e Engine) maxSpreadBpsForFundType(fundType string) decimal.Decimal {
+	switch {
+	case strings.Contains(fundType, "money"):
+		return e.cfg.MaxSpreadBpsMoneyMarket
+	case strings.Contains(fundType, "bond"):
+		return e.cfg.MaxSpreadBpsBondFunds
+	case strings.Contains(fundType, "equity"):
+		return e.cfg.MaxSpreadBpsEquityFunds
+	default:
+		return e.cfg.MaxSpreadBps
+	}
+}
+
+type normalizedType struct {
+	Raw         string
+	Key         string
+	IsZeroValue bool
+}
+
+func normalizedFundType(raw string) normalizedType {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return normalizedType{IsZeroValue: true}
+	}
+	key := strings.ReplaceAll(raw, "-", "_")
+	key = strings.ReplaceAll(key, " ", "_")
+	return normalizedType{Raw: raw, Key: key}
 }
 
 func prepareCandles(candlesByInstrument map[string][]domain.Candle) map[string][]domain.Candle {

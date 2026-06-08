@@ -244,6 +244,7 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 	})
 	execEngine := execution.NewEngine(cfg.App.Mode, cfg.TInvest.AccountID, gateway, repo)
 	execEngine.SetMaxQuoteAge(time.Duration(cfg.Execution.MaxQuoteAgeSec) * time.Second)
+	execEngine.SetFreeOrderCountPolicy(cfg.Commission.FreeOrderCountPolicy)
 	services := scheduler.Services{
 		Repo:          repo,
 		Gateway:       gateway,
@@ -272,6 +273,7 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 		EntryWindowEnd:         cfg.Execution.EntryWindowEnd,
 		NoNewEntryAfter:        cfg.Execution.NoNewEntryAfter,
 		ExitWatchStart:         cfg.Execution.ExitWatchStart,
+		ExitNotBefore:          cfg.Execution.ExitNotBefore,
 		ExitWindowStart:        cfg.Execution.ExitWindowStart,
 		ExitWindowEnd:          cfg.Execution.ExitWindowEnd,
 		HardExitDeadline:       cfg.Execution.HardExitDeadline,
@@ -287,6 +289,7 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 		APIOutageHalt:          time.Duration(cfg.Risk.APIOutageHaltSec) * time.Second,
 		RequireZeroCommission:  cfg.Commission.RequireZeroCommission,
 		QuarantineOnNonZero:    cfg.Commission.QuarantineOnNonZero,
+		FreeOrderCountPolicy:   cfg.Commission.FreeOrderCountPolicy,
 		ReconciliationInterval: 5 * time.Minute,
 		MaxOpenPositions:       minPositive(cfg.Strategy.MaxPositions, cfg.Risk.MaxOpenPositions),
 	}, services)

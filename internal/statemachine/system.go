@@ -37,6 +37,9 @@ func (s System) Recover(ctx context.Context, reconcile reconciliation.Engine) (d
 	case domain.StatePlaceEntryOrders, domain.StateMonitorEntryOrders,
 		domain.StatePlaceExitOrders, domain.StateMonitorExitOrders,
 		domain.StateHoldOvernight:
+		if !s.mode.AllowsBrokerOrders() {
+			return state, nil
+		}
 		diffs, err := reconcile.Run(ctx)
 		if err != nil {
 			return "", err
