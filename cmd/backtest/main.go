@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/shopspring/decimal"
 
@@ -71,6 +72,9 @@ func run() error {
 	}
 	if *useMinuteModel && len(minuteCandles) == 0 {
 		return fmt.Errorf("-minute-candles is required when -use-minute-model=true")
+	}
+	if err := validateMetadata(candles, metadata); err != nil {
+		return err
 	}
 	entry, err := decimal.NewFromString(*entrySlip)
 	if err != nil {
@@ -146,6 +150,20 @@ func run() error {
 		return fmt.Errorf("write result: %w", err)
 	}
 	fmt.Printf("backtest complete: trades=%d total_return=%.6f\n", result.Metrics.NumberOfTrades, result.Metrics.TotalReturn)
+	return nil
+}
+
+func validateMetadata(candles map[string][]domain.Candle, metadata map[string]backtest.InstrumentMetadata) error {
+	var missing []string
+	for instrumentUID := range candles {
+		meta := metadata[instrumentUID]
+		if meta.Lot <= 0 || !meta.MinPriceIncrement.IsPositive() {
+			missing = append(missing, instrumentUID)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing lot/min_price_increment metadata for instruments: %s", strings.Join(missing, ","))
+	}
 	return nil
 }
 

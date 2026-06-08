@@ -184,6 +184,7 @@ type FeatureSet struct {
 	TickBps             decimal.Decimal
 	ADV20               decimal.Decimal
 	ExpectedCostBps     decimal.Decimal
+	CostBreakdownJSON   string
 	NetEdgeBps          decimal.Decimal
 	EntryIntervalVolume decimal.Decimal
 	ExitIntervalVolume  decimal.Decimal

@@ -127,7 +127,7 @@ APP_MODE=backtest go run ./cmd/bot
 | `RISK_RISK_BUDGET_PER_INSTRUMENT_PCT` | доля equity | `0.005` | рекомендуется `> 0` | Риск-бюджет на инструмент, используется вместе с оценкой неблагоприятного overnight-движения. Больше - крупнее позиции при прочих равных. |
 | `RISK_MIN_ORDER_NOTIONAL_RUB` | сумма в рублях | `1000` | `> 0` включает минимум; `<= 0` фактически отключает | Минимальный notional заявки. Если рассчитанная позиция меньше, сигнал отклоняется по sizing. |
 
-Если средний `realized_edge_bps - expected_net_edge_bps` по последним 20 закрытым сделкам ниже `-10 bps`, scheduler пишет `risk_event(WARN, size_reduction_rule_triggered)` и до восстановления качества режет sizing до `0.5x`.
+Если средний `realized_edge_bps - expected_net_edge_bps` по последним 20 закрытым сделкам ниже `-10 bps`, scheduler пишет `risk_event(WARN, size_reduction_rule_triggered)` и до восстановления качества режет sizing до `0.5x`. Если два таких окна по 20 сделок идут подряд в `live_trade`, бот автоматически переключает persisted/runtime mode в `live_readonly` и блокирует новые брокерские заявки до ручного вмешательства.
 
 ### LIQ
 
@@ -188,6 +188,7 @@ make race
 make build
 go run ./cmd/migrate -direction=up
 go run ./cmd/migrate up
+go run ./cmd/mode-days -check=true
 go run ./cmd/backtest -candles candles.csv -out ./backtest_out
 go run ./cmd/backtest -candles candles.csv -minute-candles minute.csv -use-minute-model -out ./backtest_out
 go run ./cmd/bot -mode=paper
@@ -199,11 +200,13 @@ go run ./cmd/bot -healthcheck
 Backtest CSV columns:
 
 ```csv
-instrument_uid,trade_date,open,high,low,close,volume_lots
-TRUR,2024-01-09,100,101,99,100.5,10000
+instrument_uid,trade_date,open,high,low,close,volume_lots,lot,min_price_increment
+TRUR,2024-01-09,100,101,99,100.5,10000,10,0.01
 ```
 
-Для minute-модели используется тот же формат, но `trade_date` может быть timestamp (`2024-01-09T18:25:00Z` или `2024-01-09 18:25:00`).
+Для minute-модели используется тот же формат, но `trade_date` может быть timestamp (`2024-01-09T18:25:00Z` или `2024-01-09 18:25:00`). CLI backtest требует `lot` и `min_price_increment` для каждого `instrument_uid`; metadata можно дать в daily CSV или в minute CSV.
+
+`cmd/mode-days` считает distinct-дни по `system_state_history` и проверяет пороги `live_readonly >= 20`, `paper >= 20`, `sandbox >= 10`. История пишется после миграции `0010`; дни до неё автоматически восстановить нельзя, потому что старая схема хранила только текущий `system_state`.
 
 `ClientOrderID` детерминирован по `(date, instrument_uid, side, attempt)`, укладывается в лимит T-Invest `order_id <= 36` и содержит SHA-256 suffix. При ручных массовых перезапусках с теми же параметрами id остаётся тем же, что намеренно подавляет дубли.
 

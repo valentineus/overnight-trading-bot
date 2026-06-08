@@ -80,6 +80,7 @@ type featureRow struct {
 	TickBps             decimal.Decimal `db:"tick_bps"`
 	ADV20               decimal.Decimal `db:"adv_20"`
 	ExpectedCostBps     decimal.Decimal `db:"expected_cost_bps"`
+	CostBreakdownJSON   sql.NullString  `db:"cost_breakdown_json"`
 	NetEdgeBps          decimal.Decimal `db:"net_edge_bps"`
 	EntryIntervalVolume decimal.Decimal `db:"entry_interval_volume"`
 	ExitIntervalVolume  decimal.Decimal `db:"exit_interval_volume"`
@@ -104,6 +105,7 @@ func featureRowFromDomain(feature domain.FeatureSet) featureRow {
 		TickBps:             feature.TickBps,
 		ADV20:               feature.ADV20,
 		ExpectedCostBps:     feature.ExpectedCostBps,
+		CostBreakdownJSON:   sql.NullString{String: feature.CostBreakdownJSON, Valid: feature.CostBreakdownJSON != ""},
 		NetEdgeBps:          feature.NetEdgeBps,
 		EntryIntervalVolume: feature.EntryIntervalVolume,
 		ExitIntervalVolume:  feature.ExitIntervalVolume,
@@ -129,6 +131,7 @@ func (r featureRow) domain() domain.FeatureSet {
 		TickBps:             r.TickBps,
 		ADV20:               r.ADV20,
 		ExpectedCostBps:     r.ExpectedCostBps,
+		CostBreakdownJSON:   r.CostBreakdownJSON.String,
 		NetEdgeBps:          r.NetEdgeBps,
 		EntryIntervalVolume: r.EntryIntervalVolume,
 		ExitIntervalVolume:  r.ExitIntervalVolume,

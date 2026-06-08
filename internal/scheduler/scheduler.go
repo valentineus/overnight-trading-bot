@@ -32,6 +32,7 @@ import (
 const (
 	sizeReductionWindowTrades  = 20
 	sizeReductionFactor        = 0.5
+	sizeReductionTriggerBps    = -10
 	intervalVolumeLookbackDays = 20
 )
 
@@ -899,29 +900,35 @@ func (s *Scheduler) applySizeReductionRule(ctx context.Context, tradeDate time.T
 	if err != nil {
 		return err
 	}
-	if !ok || count < sizeReductionWindowTrades || averageError.GreaterThanOrEqual(decimal.NewFromInt(-10)) {
+	if !ok || count < sizeReductionWindowTrades || averageError.GreaterThanOrEqual(decimal.NewFromInt(sizeReductionTriggerBps)) {
 		s.svc.Sizer = s.svc.Sizer.WithSizeFactor(decimal.NewFromInt(1))
 		return nil
 	}
 	factor := decimal.NewFromFloat(sizeReductionFactor)
 	s.svc.Sizer = s.svc.Sizer.WithSizeFactor(factor)
-	if !emitEvent {
-		return nil
+	if emitEvent {
+		if err := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+			Severity:    domain.SeverityWarn,
+			EventType:   "size_reduction_rule_triggered",
+			Message:     fmt.Sprintf("average expected_error_bps over %d trades is %s; sizing factor set to %s", count, averageError.StringFixed(2), factor.String()),
+			ContextJSON: fmt.Sprintf(`{"average_expected_error_bps":%q,"trades":%d,"size_factor":%q}`, averageError.String(), count, factor.String()),
+		}); err != nil {
+			return err
+		}
 	}
-	if err := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
-		Severity:    domain.SeverityWarn,
-		EventType:   "size_reduction_rule_triggered",
-		Message:     fmt.Sprintf("average expected_error_bps over %d trades is %s; sizing factor set to %s", count, averageError.StringFixed(2), factor.String()),
-		ContextJSON: fmt.Sprintf(`{"average_expected_error_bps":%q,"trades":%d,"size_factor":%q}`, averageError.String(), count, factor.String()),
-	}); err != nil {
-		return err
-	}
-	return s.recommendLiveReadonlyAfterSizeReduction(ctx, averageError, count, factor)
+	return s.handleLiveReadonlyAfterSizeReduction(ctx, tradeDate, averageError, count, factor, emitEvent)
 }
 
 func (s Scheduler) averageExpectedErrorBps(ctx context.Context, tradeDate time.Time, limit int) (decimal.Decimal, int, bool, error) {
+	return s.averageExpectedErrorBpsWindow(ctx, tradeDate, 0, limit)
+}
+
+func (s Scheduler) averageExpectedErrorBpsWindow(ctx context.Context, tradeDate time.Time, offset, limit int) (decimal.Decimal, int, bool, error) {
 	if limit <= 0 {
 		return decimal.Zero, 0, false, nil
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	positionsList, err := s.svc.Repo.ListPositions(ctx, s.svc.AccountIDHash, tradeDate.AddDate(0, 0, -120), tradeDate)
 	if err != nil {
@@ -948,6 +955,10 @@ func (s Scheduler) averageExpectedErrorBps(ctx context.Context, tradeDate time.T
 		for _, sig := range signals {
 			if sig.InstrumentUID != pos.InstrumentUID || sig.Decision != domain.DecisionEnter {
 				continue
+			}
+			if offset > 0 {
+				offset--
+				break
 			}
 			errorsBps = append(errorsBps, pos.RealizedEdgeBps.Sub(sig.NetEdgeBps))
 			break
@@ -1229,6 +1240,10 @@ func (s Scheduler) checkEntryInstrumentBeforeOrder(instrument domain.Instrument,
 }
 
 func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentUID string, portfolio domain.Portfolio, openPositions int, closingPosition bool, tradingStatus domain.TradingStatus, quoteReceivedAt time.Time) (risk.PreTradeResult, error) {
+	serverClockDrift, serverTimeUnavailable, err := s.preTradeClockDrift(ctx, now)
+	if err != nil {
+		return risk.PreTradeResult{}, err
+	}
 	metrics, err := s.riskMetrics(ctx, now, portfolio)
 	if err != nil {
 		if haltErr := s.halt(ctx, "database_unavailable", fmt.Sprintf("pre-trade risk metrics unavailable: %s", err), instrumentUID); haltErr != nil {
@@ -1241,19 +1256,22 @@ func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentU
 		return risk.PreTradeResult{}, err
 	}
 	result := s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
-		Portfolio:            portfolio,
-		OpenPositions:        openPositions,
-		ClosingPosition:      closingPosition,
-		DailyPnL:             metrics.dailyPnL,
-		WeeklyPnL:            metrics.weeklyPnL,
-		MonthlyDrawdownPct:   metrics.monthlyDrawdownPct,
-		AvgSlippageBps10:     metrics.avgSlippageBps10,
-		TradingStatus:        tradingStatus,
-		QuoteReceivedAt:      quoteReceivedAt,
-		Now:                  now.UTC(),
-		MarketClose:          s.preTradeDeadlineOn(now, closingPosition),
-		UnknownBrokerOrder:   unknownOrder,
-		UnknownBrokerHolding: unknownHolding,
+		Portfolio:             portfolio,
+		OpenPositions:         openPositions,
+		ClosingPosition:       closingPosition,
+		DailyPnL:              metrics.dailyPnL,
+		WeeklyPnL:             metrics.weeklyPnL,
+		MonthlyDrawdownPct:    metrics.monthlyDrawdownPct,
+		AvgSlippageBps10:      metrics.avgSlippageBps10,
+		TradingStatus:         tradingStatus,
+		QuoteReceivedAt:       quoteReceivedAt,
+		Now:                   now.UTC(),
+		MarketClose:           s.preTradeDeadlineOn(now, closingPosition),
+		ServerTimeUnavailable: serverTimeUnavailable,
+		ServerClockDrift:      serverClockDrift,
+		MaxClockDrift:         s.cfg.MaxClockDrift,
+		UnknownBrokerOrder:    unknownOrder,
+		UnknownBrokerHolding:  unknownHolding,
 	})
 	if !result.Allowed && isHardHaltPreTradeReason(result.Reason) {
 		if err := s.halt(ctx, result.Reason, fmt.Sprintf("pre-trade hard limit breached: %s", result.Reason), instrumentUID); err != nil {
@@ -1262,6 +1280,20 @@ func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentU
 		return result, fmt.Errorf("%w: %s", statemachine.ErrSystemHalted, result.Reason)
 	}
 	return result, nil
+}
+
+func (s Scheduler) preTradeClockDrift(ctx context.Context, now time.Time) (time.Duration, bool, error) {
+	if s.cfg.MaxClockDrift <= 0 || s.svc.Gateway == nil {
+		return 0, false, nil
+	}
+	serverTime, err := s.svc.Gateway.GetServerTime(ctx)
+	if err != nil {
+		if s.cfg.Mode == domain.ModePaper {
+			return 0, false, nil
+		}
+		return 0, true, nil
+	}
+	return timeutil.Drift(now.UTC(), serverTime), false, nil
 }
 
 func (s Scheduler) unknownBrokerState(ctx context.Context, portfolio domain.Portfolio) (bool, bool, error) {
@@ -1309,6 +1341,8 @@ func (s Scheduler) unknownBrokerState(ctx context.Context, portfolio domain.Port
 func isHardHaltPreTradeReason(reason string) bool {
 	switch reason {
 	case "database_unavailable",
+		"server_time_unavailable",
+		"server_clock_drift_too_high",
 		"unknown_broker_order",
 		"unknown_broker_position",
 		"trading_status_unknown_before_order",
@@ -1390,6 +1424,70 @@ func (s Scheduler) preTradeDeadlineOn(now time.Time, closingPosition bool) time.
 		return s.cfg.NoNewEntryAfter.On(now, s.cfg.Location).UTC()
 	}
 	return s.marketCloseOn(now)
+}
+
+func (s *Scheduler) handleLiveReadonlyAfterSizeReduction(ctx context.Context, tradeDate time.Time, averageError decimal.Decimal, count int, factor decimal.Decimal, emitRecommendation bool) error {
+	if s.cfg.Mode != domain.ModeLiveTrade {
+		return nil
+	}
+	previousAverage, previousCount, previousOK, err := s.averageExpectedErrorBpsWindow(ctx, tradeDate, sizeReductionWindowTrades, sizeReductionWindowTrades)
+	if err != nil {
+		return err
+	}
+	if previousOK && previousCount == sizeReductionWindowTrades && previousAverage.LessThan(decimal.NewFromInt(sizeReductionTriggerBps)) {
+		return s.activateLiveReadonly(ctx, averageError, count, previousAverage, previousCount, factor)
+	}
+	if !emitRecommendation {
+		return nil
+	}
+	return s.recommendLiveReadonlyAfterSizeReduction(ctx, averageError, count, factor)
+}
+
+func (s *Scheduler) activateLiveReadonly(ctx context.Context, averageError decimal.Decimal, count int, previousAverage decimal.Decimal, previousCount int, factor decimal.Decimal) error {
+	if s.cfg.Mode != domain.ModeLiveTrade {
+		return nil
+	}
+	if s.svc.Repo == nil {
+		return nil
+	}
+	state, halted, reason, err := s.svc.Repo.GetSystemState(ctx)
+	if err != nil {
+		return err
+	}
+	if halted || state == domain.StateHalted {
+		return nil
+	}
+	message := fmt.Sprintf(
+		"average expected_error_bps stayed below %d for two consecutive %d-trade windows; switching to live_readonly",
+		sizeReductionTriggerBps,
+		sizeReductionWindowTrades,
+	)
+	s.cfg.Mode = domain.ModeLiveReadonly
+	if s.svc.Execution != nil {
+		s.svc.Execution.SetMode(domain.ModeLiveReadonly)
+	}
+	s.sm = statemachine.New(s.svc.Repo, domain.ModeLiveReadonly)
+	contextJSON := fmt.Sprintf(
+		`{"average_expected_error_bps":%q,"trades":%d,"previous_average_expected_error_bps":%q,"previous_trades":%d,"size_factor":%q,"mode":%q}`,
+		averageError.String(),
+		count,
+		previousAverage.String(),
+		previousCount,
+		factor.String(),
+		domain.ModeLiveReadonly,
+	)
+	if err := s.svc.Repo.SaveSystemState(ctx, state, domain.ModeLiveReadonly, false, reason, contextJSON); err != nil {
+		return err
+	}
+	if s.svc.Notifier != nil {
+		_ = s.svc.Notifier.Alert(ctx, message)
+	}
+	return s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+		Severity:    domain.SeverityAlert,
+		EventType:   "live_readonly_activated",
+		Message:     message,
+		ContextJSON: contextJSON,
+	})
 }
 
 func (s Scheduler) recommendLiveReadonlyAfterSizeReduction(ctx context.Context, averageError decimal.Decimal, count int, factor decimal.Decimal) error {

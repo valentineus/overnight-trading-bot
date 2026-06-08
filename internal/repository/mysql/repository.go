@@ -231,13 +231,13 @@ func (r *Repository) mergeFeatures(ctx context.Context, oldInstrumentUID, newIns
 INSERT INTO features (
   instrument_uid, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60, q05_on_60_abs,
   tstat_on_60, win_on_60, ewma_on, spread_bps, half_spread_bps, tick_bps,
-  adv_20, expected_cost_bps, net_edge_bps, entry_interval_volume,
+  adv_20, expected_cost_bps, cost_breakdown_json, net_edge_bps, entry_interval_volume,
   exit_interval_volume, calculated_at
 )
 SELECT
   ?, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60, q05_on_60_abs,
   tstat_on_60, win_on_60, ewma_on, spread_bps, half_spread_bps, tick_bps,
-  adv_20, expected_cost_bps, net_edge_bps, entry_interval_volume,
+  adv_20, expected_cost_bps, cost_breakdown_json, net_edge_bps, entry_interval_volume,
   exit_interval_volume, calculated_at
 FROM features WHERE instrument_uid=?
 ON DUPLICATE KEY UPDATE
@@ -247,6 +247,7 @@ ON DUPLICATE KEY UPDATE
   ewma_on=VALUES(ewma_on), spread_bps=VALUES(spread_bps),
   half_spread_bps=VALUES(half_spread_bps), tick_bps=VALUES(tick_bps),
   adv_20=VALUES(adv_20), expected_cost_bps=VALUES(expected_cost_bps),
+  cost_breakdown_json=VALUES(cost_breakdown_json),
   net_edge_bps=VALUES(net_edge_bps), entry_interval_volume=VALUES(entry_interval_volume),
   exit_interval_volume=VALUES(exit_interval_volume), calculated_at=VALUES(calculated_at)`, newInstrumentUID, oldInstrumentUID)
 	if err != nil {
@@ -392,12 +393,12 @@ func (r *Repository) UpsertFeature(ctx context.Context, feature domain.FeatureSe
 INSERT INTO features (
   instrument_uid, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60, q05_on_60_abs,
   tstat_on_60, win_on_60, ewma_on, spread_bps, half_spread_bps, tick_bps,
-  adv_20, expected_cost_bps, net_edge_bps, entry_interval_volume,
+  adv_20, expected_cost_bps, cost_breakdown_json, net_edge_bps, entry_interval_volume,
   exit_interval_volume, calculated_at
 ) VALUES (
   :instrument_uid, :trade_date, :r_on, :r_day, :mu_on_60, :mu_on_252, :sigma_on_60, :q05_on_60_abs,
   :tstat_on_60, :win_on_60, :ewma_on, :spread_bps, :half_spread_bps, :tick_bps,
-  :adv_20, :expected_cost_bps, :net_edge_bps, :entry_interval_volume,
+  :adv_20, :expected_cost_bps, :cost_breakdown_json, :net_edge_bps, :entry_interval_volume,
   :exit_interval_volume, :calculated_at
 ) ON DUPLICATE KEY UPDATE
   r_on=VALUES(r_on), r_day=VALUES(r_day), mu_on_60=VALUES(mu_on_60),
@@ -406,6 +407,7 @@ INSERT INTO features (
   ewma_on=VALUES(ewma_on), spread_bps=VALUES(spread_bps),
   half_spread_bps=VALUES(half_spread_bps), tick_bps=VALUES(tick_bps),
   adv_20=VALUES(adv_20), expected_cost_bps=VALUES(expected_cost_bps),
+  cost_breakdown_json=VALUES(cost_breakdown_json),
   net_edge_bps=VALUES(net_edge_bps), entry_interval_volume=VALUES(entry_interval_volume),
   exit_interval_volume=VALUES(exit_interval_volume), calculated_at=VALUES(calculated_at)`, featureRowFromDomain(feature))
 	return err
@@ -670,7 +672,10 @@ ON DUPLICATE KEY UPDATE
   halt_reason=IF(halted=1 AND VALUES(halted)=0, halt_reason, VALUES(halt_reason)),
   last_heartbeat=VALUES(last_heartbeat),
   context_json=VALUES(context_json)`, state, mode, halted, nullableString(reason), contextJSON)
-	return err
+	if err != nil {
+		return err
+	}
+	return r.insertSystemStateHistory(ctx, state, mode, halted, reason, contextJSON)
 }
 
 func (r *Repository) forceSaveSystemState(ctx context.Context, state domain.SystemState, mode domain.Mode, halted bool, reason string, contextJSON string) error {
@@ -684,6 +689,16 @@ ON DUPLICATE KEY UPDATE
   state=VALUES(state), mode=VALUES(mode), halted=VALUES(halted),
   halt_reason=VALUES(halt_reason), last_heartbeat=VALUES(last_heartbeat),
   context_json=VALUES(context_json)`, state, mode, halted, nullableString(reason), contextJSON)
+	if err != nil {
+		return err
+	}
+	return r.insertSystemStateHistory(ctx, state, mode, halted, reason, contextJSON)
+}
+
+func (r *Repository) insertSystemStateHistory(ctx context.Context, state domain.SystemState, mode domain.Mode, halted bool, reason string, contextJSON string) error {
+	_, err := r.execer().ExecContext(ctx, `
+INSERT INTO system_state_history (ts, state, mode, halted, halt_reason, context_json)
+VALUES (UTC_TIMESTAMP(3), ?, ?, ?, ?, ?)`, state, mode, halted, nullableString(reason), contextJSON)
 	return err
 }
 
@@ -729,6 +744,10 @@ func (r *Repository) getSystemMode(ctx context.Context) (domain.Mode, error) {
 		return "", err
 	}
 	return mode, nil
+}
+
+func (r *Repository) GetSystemMode(ctx context.Context) (domain.Mode, error) {
+	return r.getSystemMode(ctx)
 }
 
 func (r *Repository) WasDailyReportSent(ctx context.Context, reportDate time.Time, accountIDHash string) (bool, error) {

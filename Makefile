@@ -45,6 +45,7 @@ build: cache
 	$(GO) build -trimpath -o bin/bot ./cmd/bot
 	$(GO) build -trimpath -o bin/migrate ./cmd/migrate
 	$(GO) build -trimpath -o bin/backtest ./cmd/backtest
+	$(GO) build -trimpath -o bin/mode-days ./cmd/mode-days
 
 backtest: cache
 	$(GO) run ./cmd/backtest -candles "$${BT_CANDLES:?set BT_CANDLES}"

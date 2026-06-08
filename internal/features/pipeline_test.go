@@ -2,6 +2,7 @@ package features
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -44,6 +45,24 @@ func TestComputeExpectedCostIncludesCommissionAndSlippage(t *testing.T) {
 	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(22)) {
 		t.Fatalf("expected cost=%s, want 22", got.ExpectedCostBps)
 	}
+	var breakdown map[string]string
+	if err := json.Unmarshal([]byte(got.CostBreakdownJSON), &breakdown); err != nil {
+		t.Fatalf("cost breakdown is not valid JSON: %v", err)
+	}
+	wantBreakdown := map[string]string{
+		"expected_spread_entry_bps":   "5",
+		"expected_spread_exit_bps":    "5",
+		"expected_slippage_entry_bps": "2",
+		"expected_slippage_exit_bps":  "3",
+		"commission_roundtrip_bps":    "2",
+		"risk_buffer_bps":             "5",
+		"expected_cost_bps":           "22",
+	}
+	for key, want := range wantBreakdown {
+		if breakdown[key] != want {
+			t.Fatalf("breakdown[%s]=%q, want %q in %s", key, breakdown[key], want, got.CostBreakdownJSON)
+		}
+	}
 	if !got.EntryIntervalVolume.Equal(decimal.NewFromInt(10000)) || !got.ExitIntervalVolume.Equal(decimal.NewFromInt(9000)) {
 		t.Fatalf("interval volumes were not preserved: %+v", got)
 	}
@@ -72,7 +91,7 @@ func TestComputeExpectedCostFallsBackToConfigCommission(t *testing.T) {
 }
 
 func TestComputeStoresHistoricalQ05Abs(t *testing.T) {
-	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
 	returns := []string{"-0.10", "0.01", "0.02", "0.03", "0.04"}
 	candles := []domain.Candle{{
 		InstrumentUID: "uid",
@@ -89,13 +108,13 @@ func TestComputeStoresHistoricalQ05Abs(t *testing.T) {
 		open := decimal.NewFromInt(100).Mul(decimal.NewFromInt(1).Add(r))
 		candles = append(candles, domain.Candle{
 			InstrumentUID: "uid",
-			TradeDate:     start.AddDate(0, 0, i+1),
+			TradeDate:     addBusinessDays(start, i+1),
 			Open:          open,
 			Close:         decimal.NewFromInt(100),
 			VolumeLots:    decimal.NewFromInt(1),
 		})
 	}
-	got, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, start.AddDate(0, 0, 6), SpreadResult{}, PipelineConfig{
+	got, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, addBusinessDays(start, 6), SpreadResult{}, PipelineConfig{
 		RollingShort: 5,
 		RollingLong:  5,
 		EWMALambda:   0.08,
@@ -113,6 +132,48 @@ func TestComputeStoresHistoricalQ05Abs(t *testing.T) {
 	}
 }
 
+func TestComputeSkipsOvernightReturnAcrossMissingWeekday(t *testing.T) {
+	start := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC) // Monday.
+	candles := []domain.Candle{
+		{InstrumentUID: "uid", TradeDate: start, Open: decimal.NewFromInt(100), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+		{InstrumentUID: "uid", TradeDate: start.AddDate(0, 0, 1), Open: decimal.NewFromInt(101), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+		{InstrumentUID: "uid", TradeDate: start.AddDate(0, 0, 3), Open: decimal.NewFromInt(50), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+	}
+	got, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, start.AddDate(0, 0, 4), SpreadResult{}, PipelineConfig{
+		RollingShort: 1,
+		RollingLong:  1,
+		EWMALambda:   0.08,
+	}, decimal.Zero, decimal.Zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decimal.RequireFromString("0.01")
+	if !got.ROn.Equal(want) {
+		t.Fatalf("ROn=%s, want %s from last consecutive pair", got.ROn, want)
+	}
+}
+
+func TestComputeAllowsWeekendGap(t *testing.T) {
+	friday := time.Date(2026, 1, 9, 0, 0, 0, 0, time.UTC)
+	monday := friday.AddDate(0, 0, 3)
+	candles := []domain.Candle{
+		{InstrumentUID: "uid", TradeDate: friday, Open: decimal.NewFromInt(100), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+		{InstrumentUID: "uid", TradeDate: monday, Open: decimal.NewFromInt(101), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+	}
+	got, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, monday.AddDate(0, 0, 1), SpreadResult{}, PipelineConfig{
+		RollingShort: 1,
+		RollingLong:  1,
+		EWMALambda:   0.08,
+	}, decimal.Zero, decimal.Zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decimal.RequireFromString("0.01")
+	if !got.ROn.Equal(want) {
+		t.Fatalf("ROn=%s, want %s across weekend", got.ROn, want)
+	}
+}
+
 func flatCandles(start time.Time, count int) []domain.Candle {
 	candles := make([]domain.Candle, 0, count)
 	for i := 0; i < count; i++ {
@@ -126,6 +187,18 @@ func flatCandles(start time.Time, count int) []domain.Candle {
 		})
 	}
 	return candles
+}
+
+func addBusinessDays(start time.Time, days int) time.Time {
+	out := start
+	for added := 0; added < days; {
+		out = out.AddDate(0, 0, 1)
+		if out.Weekday() == time.Saturday || out.Weekday() == time.Sunday {
+			continue
+		}
+		added++
+	}
+	return out
 }
 
 func TestIntervalVolume(t *testing.T) {

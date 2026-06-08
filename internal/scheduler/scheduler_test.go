@@ -564,6 +564,42 @@ func TestPreTradeDailyLossBreachHalts(t *testing.T) {
 	}
 }
 
+func TestPreTradeClockDriftBreachHalts(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 8, 18, 20, 0, 0, time.UTC)
+	gateway := tinvest.NewFakeGateway()
+	gateway.ServerTime = now.Add(3 * time.Second)
+	notifier := &countNotifier{}
+	s := Scheduler{
+		cfg: Config{
+			Mode:          domain.ModePaper,
+			Location:      time.UTC,
+			MaxClockDrift: 2 * time.Second,
+		},
+		svc: Services{
+			Repo:          repo,
+			Gateway:       gateway,
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{}),
+			Notifier:      notifier,
+			AccountIDHash: "hash",
+		},
+	}
+	_, err := s.preTradeCheck(ctx, now, "uid", domain.Portfolio{
+		Equity: decimal.NewFromInt(10000),
+		Cash:   decimal.NewFromInt(10000),
+	}, 0, false, domain.TradingStatusNormal, now)
+	if !errors.Is(err, statemachine.ErrSystemHalted) {
+		t.Fatalf("err=%v, want ErrSystemHalted", err)
+	}
+	if !repo.Halted || repo.HaltReason != "pre-trade hard limit breached: server_clock_drift_too_high" {
+		t.Fatalf("halted=%v reason=%q", repo.Halted, repo.HaltReason)
+	}
+	if notifier.alerts != 1 {
+		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
 func TestPreTradeUsesPhaseDeadlineForMinTimeToClose(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -809,6 +845,78 @@ func TestSizeReductionRuleRecommendsLiveReadonlyInLiveTrade(t *testing.T) {
 	}
 	if notifier.alerts != 1 {
 		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
+func TestRepeatedSizeReductionRuleActivatesLiveReadonly(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	notifier := &countNotifier{}
+	tradeDate := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < sizeReductionWindowTrades*2; i++ {
+		date := tradeDate.AddDate(0, 0, -i)
+		if err := repo.UpsertSignal(ctx, domain.Signal{
+			TradeDate:     date,
+			InstrumentUID: "uid",
+			Decision:      domain.DecisionEnter,
+			NetEdgeBps:    decimal.NewFromInt(20),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.UpsertPosition(ctx, domain.Position{
+			AccountIDHash:   "hash",
+			InstrumentUID:   "uid",
+			OpenTradeDate:   date,
+			Lot:             1,
+			Status:          domain.PositionExitFilled,
+			RealizedEdgeBps: decimal.Zero,
+			UpdatedAt:       date.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	execEngine := execution.NewEngine(domain.ModeLiveTrade, "account", nil, repo)
+	s := Scheduler{
+		cfg: Config{Mode: domain.ModeLiveTrade},
+		sm:  statemachine.New(repo, domain.ModeLiveTrade),
+		svc: Services{
+			Repo:          repo,
+			AccountIDHash: "hash",
+			Notifier:      notifier,
+			Execution:     &execEngine,
+			Sizer: risk.NewSizer(risk.SizingConfig{
+				MaxPositionPct:             decimal.NewFromInt(1),
+				MaxTotalExposurePct:        decimal.NewFromInt(1),
+				MaxParticipationRate:       decimal.NewFromInt(1),
+				CashUsageBuffer:            decimal.NewFromInt(1),
+				RiskBudgetPerInstrumentPct: decimal.NewFromInt(1),
+				MinOrderNotionalRUB:        decimal.NewFromInt(1),
+			}),
+		},
+	}
+	if err := s.applySizeReductionRule(ctx, tradeDate, true); err != nil {
+		t.Fatal(err)
+	}
+	if repo.Mode != domain.ModeLiveReadonly || s.cfg.Mode != domain.ModeLiveReadonly {
+		t.Fatalf("modes repo=%s scheduler=%s, want live_readonly", repo.Mode, s.cfg.Mode)
+	}
+	if len(repo.RiskEvents) != 2 || repo.RiskEvents[1].EventType != "live_readonly_activated" || repo.RiskEvents[1].Severity != domain.SeverityAlert {
+		t.Fatalf("risk events=%+v, want live_readonly activation alert", repo.RiskEvents)
+	}
+	if notifier.alerts != 1 {
+		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+	_, err := execEngine.PlaceLimit(ctx, domain.Order{
+		ClientOrderID: "order",
+		InstrumentUID: "uid",
+		TradeDate:     tradeDate,
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    decimal.NewFromInt(100),
+		QuantityLots:  1,
+	})
+	if !errors.Is(err, execution.ErrBrokerOrdersDisabled) {
+		t.Fatalf("PlaceLimit err=%v, want ErrBrokerOrdersDisabled after live_readonly activation", err)
 	}
 }
 

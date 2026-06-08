@@ -2,6 +2,7 @@ package risk
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -24,5 +25,32 @@ func TestPreTradeClosingPositionBypassesOpenPositionLimit(t *testing.T) {
 	result = manager.PreTradeCheck(input)
 	if result.Allowed || result.Reason != "max_open_positions" {
 		t.Fatalf("entry result=%+v, want max_open_positions reject", result)
+	}
+}
+
+func TestPreTradeRejectsServerClockDrift(t *testing.T) {
+	manager := NewManager(nil, ManagerConfig{})
+	input := PreTradeInput{
+		Portfolio:        domain.Portfolio{Equity: decimal.NewFromInt(1000)},
+		TradingStatus:    domain.TradingStatusNormal,
+		ServerClockDrift: 3 * time.Second,
+		MaxClockDrift:    2 * time.Second,
+	}
+	result := manager.PreTradeCheck(input)
+	if result.Allowed || result.Reason != "server_clock_drift_too_high" {
+		t.Fatalf("result=%+v, want server_clock_drift_too_high reject", result)
+	}
+}
+
+func TestPreTradeRejectsUnavailableServerTime(t *testing.T) {
+	manager := NewManager(nil, ManagerConfig{})
+	input := PreTradeInput{
+		Portfolio:             domain.Portfolio{Equity: decimal.NewFromInt(1000)},
+		TradingStatus:         domain.TradingStatusNormal,
+		ServerTimeUnavailable: true,
+	}
+	result := manager.PreTradeCheck(input)
+	if result.Allowed || result.Reason != "server_time_unavailable" {
+		t.Fatalf("result=%+v, want server_time_unavailable reject", result)
 	}
 }

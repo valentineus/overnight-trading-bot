@@ -69,6 +69,10 @@ func NewEngine(mode domain.Mode, accountID string, gateway Gateway, store reposi
 	}
 }
 
+func (e *Engine) SetMode(mode domain.Mode) {
+	e.mode = mode
+}
+
 func (e *Engine) SetMaxQuoteAge(maxQuoteAge time.Duration) {
 	e.maxQuoteAge = maxQuoteAge
 }

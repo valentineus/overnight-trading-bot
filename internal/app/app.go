@@ -150,6 +150,16 @@ func Run(ctx context.Context, opts Options) error {
 		_, _ = fmt.Fprintf(opts.Stdout, "system unhalted: %s\n", opts.Reason)
 		return nil
 	}
+	if cfg.App.Mode == domain.ModeLiveTrade {
+		persistedMode, err := repo.GetSystemMode(ctx)
+		if err != nil {
+			return fmt.Errorf("read persisted system mode: %w", err)
+		}
+		if persistedMode == domain.ModeLiveReadonly {
+			cfg.App.Mode = domain.ModeLiveReadonly
+			log.Warn("runtime mode downgraded from live_trade to persisted live_readonly")
+		}
+	}
 
 	gateway, closer, err := buildGateway(ctx, cfg, log)
 	if err != nil {

@@ -2,6 +2,7 @@ package features
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -94,6 +95,9 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 	var lastROn decimal.Decimal
 	var lastRDay decimal.Decimal
 	for i := 1; i < len(candles); i++ {
+		if !consecutiveDailyCandles(candles[i-1].TradeDate, candles[i].TradeDate) {
+			continue
+		}
 		rOn, err := OvernightReturn(candles[i].Open, candles[i-1].Close)
 		if err != nil {
 			return domain.FeatureSet{}, err
@@ -107,6 +111,9 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 		lastROn = rOn
 		lastRDay = rDay
 	}
+	if len(overnight) == 0 {
+		return domain.FeatureSet{}, fmt.Errorf("need at least 1 consecutive daily candle pair")
+	}
 	short := Rolling(overnight, cfg.RollingShort, cfg.EWMALambda)
 	long := Rolling(overnight, cfg.RollingLong, cfg.EWMALambda)
 	q05Abs := rollingQ05Abs(overnight, cfg.RollingShort)
@@ -118,6 +125,7 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 		Add(cfg.ExitSlippageBps).
 		Add(commission).
 		Add(cfg.RiskBufferBps)
+	costBreakdownJSON := expectedCostBreakdownJSON(spread, cfg, commission, expectedCost)
 	return domain.FeatureSet{
 		InstrumentUID:       instrument.InstrumentUID,
 		TradeDate:           tradeDate,
@@ -135,11 +143,34 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 		TickBps:             spread.TickBps,
 		ADV20:               adv,
 		ExpectedCostBps:     expectedCost,
+		CostBreakdownJSON:   costBreakdownJSON,
 		NetEdgeBps:          rawEdgeBps.Sub(expectedCost),
 		EntryIntervalVolume: entryVolume,
 		ExitIntervalVolume:  exitVolume,
 		CalculatedAt:        time.Now().UTC(),
 	}, nil
+}
+
+func expectedCostBreakdownJSON(spread SpreadResult, cfg PipelineConfig, commission, expectedCost decimal.Decimal) string {
+	spreadEntry := spread.HalfSpreadBps
+	if spreadEntry.IsZero() && spread.SpreadBps.IsPositive() {
+		spreadEntry = spread.SpreadBps.Div(decimal.NewFromInt(2))
+	}
+	spreadExit := spread.SpreadBps.Sub(spreadEntry)
+	payload := map[string]string{
+		"expected_spread_entry_bps":   spreadEntry.String(),
+		"expected_spread_exit_bps":    spreadExit.String(),
+		"expected_slippage_entry_bps": cfg.EntrySlippageBps.String(),
+		"expected_slippage_exit_bps":  cfg.ExitSlippageBps.String(),
+		"commission_roundtrip_bps":    commission.String(),
+		"risk_buffer_bps":             cfg.RiskBufferBps.String(),
+		"expected_cost_bps":           expectedCost.String(),
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
 
 func rollingQ05Abs(values []float64, window int) decimal.Decimal {
@@ -170,7 +201,25 @@ func historicalDailyCandles(candles []domain.Candle, tradeDate time.Time) []doma
 			out = append(out, candle)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].TradeDate.Before(out[j].TradeDate)
+	})
 	return out
+}
+
+func consecutiveDailyCandles(previous, current time.Time) bool {
+	prevDay := dateOnly(previous)
+	currentDay := dateOnly(current)
+	if !currentDay.After(prevDay) {
+		return false
+	}
+	weekdays := 0
+	for day := prevDay.AddDate(0, 0, 1); !day.After(currentDay); day = day.AddDate(0, 0, 1) {
+		if day.Weekday() != time.Saturday && day.Weekday() != time.Sunday {
+			weekdays++
+		}
+	}
+	return weekdays == 1
 }
 
 func dateOnly(ts time.Time) time.Time {

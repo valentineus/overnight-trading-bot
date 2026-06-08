@@ -31,20 +31,23 @@ type ManagerConfig struct {
 }
 
 type PreTradeInput struct {
-	Portfolio            domain.Portfolio
-	OpenPositions        int
-	ClosingPosition      bool
-	DailyPnL             decimal.Decimal
-	WeeklyPnL            decimal.Decimal
-	MonthlyDrawdownPct   decimal.Decimal
-	AvgSlippageBps10     decimal.Decimal
-	TradingStatus        domain.TradingStatus
-	QuoteReceivedAt      time.Time
-	Now                  time.Time
-	MarketClose          time.Time
-	DatabaseUnavailable  bool
-	UnknownBrokerOrder   bool
-	UnknownBrokerHolding bool
+	Portfolio             domain.Portfolio
+	OpenPositions         int
+	ClosingPosition       bool
+	DailyPnL              decimal.Decimal
+	WeeklyPnL             decimal.Decimal
+	MonthlyDrawdownPct    decimal.Decimal
+	AvgSlippageBps10      decimal.Decimal
+	TradingStatus         domain.TradingStatus
+	QuoteReceivedAt       time.Time
+	Now                   time.Time
+	MarketClose           time.Time
+	ServerTimeUnavailable bool
+	ServerClockDrift      time.Duration
+	MaxClockDrift         time.Duration
+	DatabaseUnavailable   bool
+	UnknownBrokerOrder    bool
+	UnknownBrokerHolding  bool
 }
 
 type PreTradeResult struct {
@@ -84,6 +87,10 @@ func (m Manager) PreTradeCheck(input PreTradeInput) PreTradeResult {
 	switch {
 	case input.DatabaseUnavailable:
 		return reject("database_unavailable")
+	case input.ServerTimeUnavailable:
+		return reject("server_time_unavailable")
+	case input.MaxClockDrift > 0 && input.ServerClockDrift > input.MaxClockDrift:
+		return reject("server_clock_drift_too_high")
 	case input.UnknownBrokerOrder:
 		return reject("unknown_broker_order")
 	case input.UnknownBrokerHolding:
