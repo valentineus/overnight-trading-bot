@@ -96,6 +96,11 @@ func Run(ctx context.Context, opts Options) error {
 		return errors.New("-halt requires DB_DSN")
 	}
 
+	if cfg.DB.MigrationsAutoApply {
+		if err := applyMigrations(ctx, cfg); err != nil {
+			return err
+		}
+	}
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return err
@@ -103,11 +108,6 @@ func Run(ctx context.Context, opts Options) error {
 	defer func() {
 		_ = db.Close()
 	}()
-	if cfg.DB.MigrationsAutoApply {
-		if err := mysqlrepo.ApplyMigrations(ctx, db.DB); err != nil {
-			return err
-		}
-	}
 	repo := mysqlrepo.NewRepository(db)
 	if opts.Halt {
 		if strings.TrimSpace(opts.Reason) == "" {
@@ -349,6 +349,17 @@ func minPositive(a, b int) int {
 	default:
 		return b
 	}
+}
+
+func applyMigrations(ctx context.Context, cfg config.Config) error {
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+	return mysqlrepo.ApplyMigrations(ctx, db.DB)
 }
 
 func openDB(ctx context.Context, cfg config.Config) (*sqlx.DB, error) {
