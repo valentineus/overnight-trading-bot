@@ -28,33 +28,55 @@ func (l *Loader) SetClock(clock timeutil.Clock) {
 }
 
 func (l Loader) BackfillDaily(ctx context.Context, instruments []domain.Instrument, from, to time.Time) error {
+	eligible := 0
+	succeeded := 0
+	var firstErr error
 	for _, instrument := range instruments {
 		if !instrument.Enabled || instrument.Quarantine {
 			continue
 		}
+		eligible++
 		candles, err := l.gateway.GetCandles(ctx, instrument.InstrumentUID, "day", from, to)
 		if err != nil {
-			return fmt.Errorf("load candles %s: %w", instrument.Ticker, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("load candles %s: %w", instrument.Ticker, err)
+			}
+			continue
 		}
 		if err := l.repo.UpsertDailyCandles(ctx, candles); err != nil {
 			return fmt.Errorf("persist candles %s: %w", instrument.Ticker, err)
 		}
+		succeeded++
+	}
+	if eligible > 0 && succeeded == 0 && firstErr != nil {
+		return fmt.Errorf("all daily candle loads failed: %w", firstErr)
 	}
 	return nil
 }
 
 func (l Loader) BackfillMinute(ctx context.Context, instruments []domain.Instrument, from, to time.Time) error {
+	eligible := 0
+	succeeded := 0
+	var firstErr error
 	for _, instrument := range instruments {
 		if !instrument.Enabled || instrument.Quarantine {
 			continue
 		}
+		eligible++
 		candles, err := l.gateway.GetCandles(ctx, instrument.InstrumentUID, "minute", from, to)
 		if err != nil {
-			return fmt.Errorf("load minute candles %s: %w", instrument.Ticker, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("load minute candles %s: %w", instrument.Ticker, err)
+			}
+			continue
 		}
 		if err := l.repo.UpsertMinuteCandles(ctx, candles); err != nil {
 			return fmt.Errorf("persist minute candles %s: %w", instrument.Ticker, err)
 		}
+		succeeded++
+	}
+	if eligible > 0 && succeeded == 0 && firstErr != nil {
+		return fmt.Errorf("all minute candle loads failed: %w", firstErr)
 	}
 	return nil
 }

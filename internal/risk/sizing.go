@@ -13,8 +13,9 @@ import (
 )
 
 var (
-	ErrNoSizingCapacity = errors.New("no sizing capacity")
-	ErrFreeOrderBudget  = errors.New("free order budget is insufficient")
+	ErrNoSizingCapacity           = errors.New("no sizing capacity")
+	ErrFreeOrderBudget            = errors.New("free order budget is insufficient")
+	ErrFreeOrderPolicyUnspecified = errors.New("free order policy is not configured")
 )
 
 type SizingConfig struct {
@@ -131,8 +132,11 @@ func NewFreeOrderBudget(store FreeOrderStore) FreeOrderBudget {
 }
 
 func (b FreeOrderBudget) Check(ctx context.Context, tradeDate time.Time, instr domain.Instrument, ordersNeeded int) (int, error) {
-	if instr.FreeOrderLimitPerDay <= 0 {
+	if instr.FreeOrderLimitPerDay < 0 {
 		return 0, nil
+	}
+	if instr.FreeOrderLimitPerDay == 0 {
+		return 0, ErrFreeOrderPolicyUnspecified
 	}
 	sent, err := b.store.GetFreeOrdersSent(ctx, tradeDate, instr.InstrumentUID)
 	if err != nil {

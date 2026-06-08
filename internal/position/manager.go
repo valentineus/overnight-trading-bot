@@ -25,13 +25,48 @@ func (m Manager) OnEntryFill(ctx context.Context, accountIDHash string, instrume
 	if lot <= 0 {
 		lot = 1
 	}
+	fillLots := order.FilledLots
+	if fillLots < 0 {
+		fillLots = 0
+	}
+	fillPrice := order.AvgFillPrice
+	if !fillPrice.IsPositive() {
+		fillPrice = order.LimitPrice
+	}
+	if existing, ok, err := m.findEntryPosition(ctx, accountIDHash, order); err != nil {
+		return domain.Position{}, err
+	} else if ok {
+		previousLots := existing.Lots
+		totalLots := previousLots + fillLots
+		if fillLots > 0 && totalLots > 0 {
+			previousValue := existing.AvgBuyPrice.Mul(decimal.NewFromInt(previousLots))
+			fillValue := fillPrice.Mul(decimal.NewFromInt(fillLots))
+			existing.AvgBuyPrice = previousValue.Add(fillValue).Div(decimal.NewFromInt(totalLots))
+		}
+		existing.Lots = totalLots
+		existing.Lot = lot
+		existing.CommissionTotal = existing.CommissionTotal.Add(order.Commission)
+		if existing.OpenedAt == nil {
+			existing.OpenedAt = &now
+		}
+		if order.FilledLots < order.QuantityLots {
+			existing.Status = domain.PositionEntryPartiallyFilled
+		} else if existing.Status != domain.PositionHoldingOvernight {
+			existing.Status = domain.PositionEntryFilled
+		}
+		existing.UpdatedAt = now
+		if err := m.repo.UpsertPosition(ctx, existing); err != nil {
+			return domain.Position{}, err
+		}
+		return existing, nil
+	}
 	pos := domain.Position{
 		AccountIDHash:   accountIDHash,
 		InstrumentUID:   order.InstrumentUID,
 		OpenTradeDate:   order.TradeDate,
-		Lots:            order.FilledLots,
+		Lots:            fillLots,
 		Lot:             lot,
-		AvgBuyPrice:     order.AvgFillPrice,
+		AvgBuyPrice:     fillPrice,
 		CommissionTotal: order.Commission,
 		Status:          domain.PositionEntryFilled,
 		OpenedAt:        &now,
@@ -44,6 +79,28 @@ func (m Manager) OnEntryFill(ctx context.Context, accountIDHash string, instrume
 		return domain.Position{}, err
 	}
 	return pos, nil
+}
+
+func (m Manager) findEntryPosition(ctx context.Context, accountIDHash string, order domain.Order) (domain.Position, bool, error) {
+	positions, err := m.repo.ListPositions(ctx, accountIDHash, order.TradeDate, order.TradeDate)
+	if err != nil {
+		return domain.Position{}, false, err
+	}
+	for _, pos := range positions {
+		if pos.InstrumentUID != order.InstrumentUID {
+			continue
+		}
+		switch pos.Status {
+		case domain.PositionEntrySignalled,
+			domain.PositionEntryOrderSent,
+			domain.PositionEntryPartiallyFilled,
+			domain.PositionEntryFilled,
+			domain.PositionHoldingOvernight:
+			return pos, true, nil
+		default:
+		}
+	}
+	return domain.Position{}, false, nil
 }
 
 func (m Manager) OnExitFill(ctx context.Context, pos domain.Position, exitOrder domain.Order) (domain.Position, error) {

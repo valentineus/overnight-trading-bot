@@ -29,7 +29,7 @@ APP_MODE=backtest go run ./cmd/bot
 
 | Переменная | Что указывать | Дефолт | Границы/валидация | За что отвечает и что меняется |
 | --- | --- | --- | --- | --- |
-| `APP_MODE` | `backtest`, `paper`, `sandbox`, `live_readonly`, `live_trade` | нет, в `.env.example`: `paper` | обязательна; только перечисленные значения | Режим работы. `backtest` не требует БД и API в `cmd/bot`; `paper` использует fake gateway; `sandbox`, `live_readonly`, `live_trade` подключаются к T-Invest API; `live_trade` может отправлять брокерские заявки. |
+| `APP_MODE` | `backtest`, `paper`, `sandbox`, `live_readonly`, `live_trade` | нет, в `.env.example`: `paper` | обязательна; только перечисленные значения | Режим работы. `backtest` не требует БД и API в `cmd/bot`; `paper` без `TINVEST_TOKEN` использует fake gateway, а с токеном берёт реальные market data/status через T-Invest при симулированных заявках; `sandbox`, `live_readonly`, `live_trade` подключаются к T-Invest API; `live_trade` может отправлять брокерские заявки. |
 | `APP_TIMEZONE` | `Europe/Moscow` | `Europe/Moscow` | жёстко только `Europe/Moscow` | Таймзона расписания торговых окон. Изменить нельзя без изменения валидации. |
 | `APP_LOG_LEVEL` | `debug`, `info`, `warn`, `warning`, `error` | `info` | неизвестное значение трактуется как `info` | Уровень JSON-логов. Ниже уровень - больше диагностических записей. |
 | `APP_HEALTHCHECK_ADDR` | HTTP listen address, например `:3300` или `127.0.0.1:3300` | `:3300` | без отдельной валидации | Адрес `/health` и `/ready`. При изменении меняется порт или интерфейс healthcheck-сервера. |
@@ -39,11 +39,11 @@ APP_MODE=backtest go run ./cmd/bot
 
 | Переменная | Что указывать | Дефолт | Границы/валидация | За что отвечает и что меняется |
 | --- | --- | --- | --- | --- |
-| `TINVEST_TOKEN` | токен T-Invest API | пусто | обязателен для `sandbox`, `live_readonly`, `live_trade` | Доступ к реальному или sandbox API. В `paper` и `backtest` не нужен. |
+| `TINVEST_TOKEN` | токен T-Invest API | пусто | обязателен для `sandbox`, `live_readonly`, `live_trade`; опционален для `paper` | Доступ к реальному или sandbox API. В `paper` без токена используется fake gateway, с токеном - реальные market data и симулированные заявки. |
 | `TINVEST_ACCOUNT_ID` | идентификатор брокерского счёта | пусто | обязателен для `sandbox`, `live_readonly`, `live_trade` | Счёт для портфеля, заявок и сверки. Для API-режимов бот падает на старте, если account id не указан. |
 | `TINVEST_ENDPOINT` | gRPC endpoint T-Invest, обычно `host:port` | `invest-public-api.tinkoff.ru:443` | строка; валидации формата нет | Endpoint для API. В `sandbox` код принудительно использует sandbox endpoint. |
 | `TINVEST_APP_NAME` | имя приложения | `overnight-trading-bot` | строка | Передаётся в SDK как имя клиента. Меняет идентификацию приложения на стороне API/логов. |
-| `TINVEST_REQUEST_TIMEOUT_SEC` | целое число секунд | `10` | рекомендуется `> 0`; сейчас не применяется | Зарезервировано под таймаут API-запросов. На текущий код не влияет. |
+| `TINVEST_REQUEST_TIMEOUT_SEC` | целое число секунд | `10` | должно быть `> 0` | Таймаут API-запросов к T-Invest, включая retry-последовательность. Меньше значение быстрее освобождает торговый цикл при зависшем API, но повышает шанс timeout на медленной сети. |
 | `TINVEST_RETRY_COUNT` | целое число попыток | `3` | `<= 0` трактуется как одна попытка | Общее число попыток для SDK-вызовов T-Invest через exponential backoff. Больше значение повышает устойчивость к кратким сбоям, но может дольше задерживать окончательную ошибку. |
 | `TINVEST_RETRY_BACKOFF_SEC` | целое число секунд | `2` | рекомендуется `>= 0` | Начальный интервал exponential backoff для SDK-вызовов T-Invest. Больше значение снижает частоту повторов при сбоях, но дольше задерживает окончательную ошибку. |
 | `TINVEST_USE_SANDBOX` | `true` или `false` | `false` | boolean; разрешено только при `APP_MODE=sandbox` | Защитный флаг совместимости. В `live_readonly` и `live_trade` запрещён валидацией, чтобы случайно не подменить фактическую среду исполнения. |
@@ -149,6 +149,8 @@ APP_MODE=backtest go run ./cmd/bot
 | `COMM_QUARANTINE_ON_NONZERO` | `true` или `false` | `true` | boolean | При фактической брокерской комиссии `> 0` инструмент переводится в quarantine, а система останавливается через HALT по zero-commission policy. |
 | `COMM_FREE_ORDER_COUNT_POLICY` | `submitted` или `cancel_counts` | `submitted` | одно из двух значений | Политика учёта бесплатных заявок: `submitted` считает только отправку новой заявки, `cancel_counts` дополнительно считает успешные отмены перед repost. |
 
+В справочнике инструментов `free_order_limit_per_day=0` означает, что политика бесплатных заявок не настроена и новые входы запрещены; `-1` означает явно подтверждённое отсутствие дневного лимита.
+
 ### BT
 
 | Переменная | Что указывать | Дефолт | Границы/валидация | За что отвечает и что меняется |
@@ -181,6 +183,7 @@ go run ./cmd/migrate up
 go run ./cmd/backtest -candles candles.csv -out ./backtest_out
 go run ./cmd/backtest -candles candles.csv -minute-candles minute.csv -use-minute-model -out ./backtest_out
 go run ./cmd/bot -mode=paper
+go run ./cmd/bot -halt -reason="manual kill switch"
 go run ./cmd/bot -unhalt -reason="manual reconciliation complete"
 go run ./cmd/bot -healthcheck
 ```

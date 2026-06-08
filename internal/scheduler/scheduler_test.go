@@ -288,6 +288,34 @@ func TestNonZeroCommissionQuarantinesInstrumentAndHalts(t *testing.T) {
 	}
 }
 
+func TestEntryInstrumentPreTradeRejectsQuarantineAndCommission(t *testing.T) {
+	s := Scheduler{cfg: Config{RequireZeroCommission: true}}
+	err := s.checkEntryInstrumentBeforeOrder(domain.Instrument{
+		InstrumentUID:     "uid",
+		Ticker:            "TRUR",
+		Enabled:           true,
+		Quarantine:        true,
+		Lot:               1,
+		MinPriceIncrement: decimal.NewFromInt(1),
+		Currency:          "RUB",
+	}, domain.TradingStatusNormal)
+	if err == nil {
+		t.Fatal("expected quarantine rejection")
+	}
+	err = s.checkEntryInstrumentBeforeOrder(domain.Instrument{
+		InstrumentUID:                "uid",
+		Ticker:                       "TRUR",
+		Enabled:                      true,
+		Lot:                          1,
+		MinPriceIncrement:            decimal.NewFromInt(1),
+		Currency:                     "RUB",
+		ExpectedCommissionBpsPerSide: decimal.NewFromInt(1),
+	}, domain.TradingStatusNormal)
+	if err == nil || err.Error() != signalengine.ReasonCommission {
+		t.Fatalf("err=%v, want commission rejection", err)
+	}
+}
+
 func TestPreTradeDailyLossBreachHalts(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -481,13 +509,14 @@ func TestPlaceEntryRejectsWideSpreadBeforeOrder(t *testing.T) {
 	repo := testutil.NewMemoryRepository()
 	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
 	instrument := domain.Instrument{
-		InstrumentUID:     "uid",
-		Ticker:            "TRUR",
-		ClassCode:         "TQTF",
-		Enabled:           true,
-		Lot:               1,
-		MinPriceIncrement: decimal.RequireFromString("0.01"),
-		Currency:          "RUB",
+		InstrumentUID:        "uid",
+		Ticker:               "TRUR",
+		ClassCode:            "TQTF",
+		Enabled:              true,
+		Lot:                  1,
+		MinPriceIncrement:    decimal.RequireFromString("0.01"),
+		Currency:             "RUB",
+		FreeOrderLimitPerDay: -1,
 	}
 	if err := repo.UpsertInstrument(ctx, instrument); err != nil {
 		t.Fatal(err)

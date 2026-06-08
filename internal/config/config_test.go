@@ -35,8 +35,9 @@ func minimalBrokerConfig(mode domain.Mode) Config {
 			ShutdownTimeoutSec: 30,
 		},
 		TInvest: TInvestConfig{
-			Token:     "token",
-			AccountID: "account",
+			Token:             "token",
+			AccountID:         "account",
+			RequestTimeoutSec: 10,
 		},
 		DB: DBConfig{DSN: "user:pass@tcp(localhost:3306)/bot"},
 		Execution: ExecutionConfig{

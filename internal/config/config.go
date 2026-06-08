@@ -177,6 +177,9 @@ func (c *Config) Validate() error {
 	if c.App.ShutdownTimeoutSec <= 0 {
 		return errors.New("APP_SHUTDOWN_TIMEOUT_SEC must be positive")
 	}
+	if c.TInvest.RequestTimeoutSec <= 0 {
+		return errors.New("TINVEST_REQUEST_TIMEOUT_SEC must be positive")
+	}
 	if c.Execution.AllowMarketOrders {
 		return errors.New("EXEC_ALLOW_MARKET_ORDERS must remain false: strategy is LIMIT-only")
 	}

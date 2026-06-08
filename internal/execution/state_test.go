@@ -249,9 +249,10 @@ func TestMonitorUntilRepostsAndExpiresAtDeadline(t *testing.T) {
 	gateway := tinvest.NewFakeGateway()
 	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
 	instrument := domain.Instrument{
-		InstrumentUID:     "uid",
-		Lot:               1,
-		MinPriceIncrement: decimal.NewFromInt(1),
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: -1,
 	}
 	book := domain.OrderBook{
 		InstrumentUID: "uid",
@@ -300,9 +301,10 @@ func TestMonitorOnceDoesNotRepostWhenCheckRejects(t *testing.T) {
 	gateway := tinvest.NewFakeGateway()
 	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
 	instrument := domain.Instrument{
-		InstrumentUID:     "uid",
-		Lot:               1,
-		MinPriceIncrement: decimal.NewFromInt(1),
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: -1,
 	}
 	book := domain.OrderBook{
 		InstrumentUID: "uid",

@@ -507,8 +507,11 @@ func (e *Engine) repostDue(order domain.Order, after time.Duration) bool {
 }
 
 func (e *Engine) ensureRepostBudget(ctx context.Context, order domain.Order, instrument domain.Instrument) error {
-	if e.store == nil || instrument.FreeOrderLimitPerDay <= 0 {
+	if e.store == nil || instrument.FreeOrderLimitPerDay < 0 {
 		return nil
+	}
+	if instrument.FreeOrderLimitPerDay == 0 {
+		return risk.ErrFreeOrderPolicyUnspecified
 	}
 	sent, err := e.store.GetFreeOrdersSent(ctx, order.TradeDate, instrument.InstrumentUID)
 	if err != nil {

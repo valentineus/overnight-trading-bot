@@ -33,6 +33,47 @@ func TestOnEntryFillKeepsBuyCommission(t *testing.T) {
 	}
 }
 
+func TestOnEntryFillAggregatesRepostedPartialFills(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(testutil.NewMemoryRepository())
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	first, err := manager.OnEntryFill(ctx, "hash", domain.Instrument{Lot: 1}, domain.Order{
+		InstrumentUID: "uid",
+		TradeDate:     tradeDate,
+		QuantityLots:  10,
+		FilledLots:    4,
+		AvgFillPrice:  decimal.NewFromInt(100),
+		Commission:    decimal.NewFromInt(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != domain.PositionEntryPartiallyFilled || first.Lots != 4 {
+		t.Fatalf("first position=%+v, want partial 4 lots", first)
+	}
+	second, err := manager.OnEntryFill(ctx, "hash", domain.Instrument{Lot: 1}, domain.Order{
+		InstrumentUID: "uid",
+		TradeDate:     tradeDate,
+		QuantityLots:  6,
+		FilledLots:    6,
+		AvgFillPrice:  decimal.NewFromInt(110),
+		Commission:    decimal.NewFromInt(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAvg := decimal.NewFromInt(106)
+	if second.Lots != 10 || second.Status != domain.PositionEntryFilled {
+		t.Fatalf("aggregated position=%+v, want 10 lots ENTRY_FILLED", second)
+	}
+	if !second.AvgBuyPrice.Equal(wantAvg) {
+		t.Fatalf("avg buy=%s, want %s", second.AvgBuyPrice, wantAvg)
+	}
+	if !second.CommissionTotal.Equal(decimal.NewFromInt(3)) {
+		t.Fatalf("commission=%s, want 3", second.CommissionTotal)
+	}
+}
+
 func TestOnExitFillPartialUsesExecutedLots(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(testutil.NewMemoryRepository())

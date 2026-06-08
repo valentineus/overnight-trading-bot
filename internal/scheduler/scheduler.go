@@ -463,6 +463,12 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 		if err != nil {
 			tradingStatus = domain.TradingStatusUnknown
 		}
+		if err := s.checkEntryInstrumentBeforeOrder(instrument, tradingStatus); err != nil {
+			if insertErr := s.recordPreTradeReject(ctx, sig.InstrumentUID, err.Error(), `{"reason":"instrument_pre_trade"}`); insertErr != nil {
+				return insertErr
+			}
+			continue
+		}
 		portfolio, err = s.svc.Gateway.GetPortfolio(ctx, s.svc.AccountID)
 		if err != nil {
 			return err
@@ -1153,6 +1159,12 @@ func (s Scheduler) repostPreTradeCheck(ctx context.Context, now time.Time, order
 	if err != nil {
 		tradingStatus = domain.TradingStatusUnknown
 	}
+	if order.Side == domain.SideBuy {
+		if err := s.checkEntryInstrumentBeforeOrder(instrument, tradingStatus); err != nil {
+			_ = s.recordPreTradeReject(ctx, order.InstrumentUID, err.Error(), `{"reason":"instrument_pre_trade","stage":"repost"}`)
+			return err
+		}
+	}
 	portfolio, err := s.svc.Gateway.GetPortfolio(ctx, s.svc.AccountID)
 	if err != nil {
 		return err
@@ -1168,6 +1180,16 @@ func (s Scheduler) repostPreTradeCheck(ctx context.Context, now time.Time, order
 	if !pre.Allowed {
 		_ = s.recordPreTradeReject(ctx, order.InstrumentUID, pre.Reason, `{"stage":"repost"}`)
 		return errors.New(pre.Reason)
+	}
+	return nil
+}
+
+func (s Scheduler) checkEntryInstrumentBeforeOrder(instrument domain.Instrument, tradingStatus domain.TradingStatus) error {
+	if err := instruments.CheckInstrument(instrument, tradingStatus); err != nil {
+		return err
+	}
+	if s.cfg.RequireZeroCommission && instrument.ExpectedCommissionBpsPerSide.IsPositive() {
+		return errors.New(signal.ReasonCommission)
 	}
 	return nil
 }

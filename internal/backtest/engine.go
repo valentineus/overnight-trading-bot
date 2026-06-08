@@ -448,6 +448,7 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 	rawEdge := decimal.NewFromFloat(short.Mean).Mul(decimal.NewFromInt(10_000))
 	spreadBps := e.assumedSpreadBps(instrumentUID)
 	cost := spreadBps.
+		Add(spreadBps).
 		Add(e.cfg.EntrySlippageBps).
 		Add(e.cfg.ExitSlippageBps).
 		Add(e.cfg.CommissionRoundtripBps).

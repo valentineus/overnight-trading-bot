@@ -43,6 +43,7 @@ type Options struct {
 	Stdout         io.Writer
 	Stderr         io.Writer
 	ModeOverride   string
+	Halt           bool
 	Unhalt         bool
 	Reason         string
 	Healthcheck    bool
@@ -84,9 +85,15 @@ func Run(ctx context.Context, opts Options) error {
 	log := logging.New(cfg.App.LogLevel, opts.Stdout)
 	log.Info("overnight trading bot starting", "mode", cfg.App.Mode)
 
-	if cfg.App.Mode == domain.ModeBacktest && !opts.Unhalt {
+	if opts.Halt && opts.Unhalt {
+		return errors.New("-halt and -unhalt are mutually exclusive")
+	}
+	if cfg.App.Mode == domain.ModeBacktest && !opts.Unhalt && !opts.Halt {
 		_, _ = fmt.Fprintf(opts.Stdout, "overnight trading bot initialized in %s mode\n", cfg.App.Mode)
 		return nil
+	}
+	if opts.Halt && cfg.DB.DSN == "" {
+		return errors.New("-halt requires DB_DSN")
 	}
 
 	db, err := openDB(ctx, cfg)
@@ -102,6 +109,16 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	repo := mysqlrepo.NewRepository(db)
+	if opts.Halt {
+		if strings.TrimSpace(opts.Reason) == "" {
+			return errors.New("-halt requires -reason")
+		}
+		if err := risk.NewManager(repo, risk.ManagerConfig{}).Halt(ctx, cfg.App.Mode, "manual_halt", opts.Reason, ""); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(opts.Stdout, "system halted: %s\n", opts.Reason)
+		return nil
+	}
 	if opts.Unhalt {
 		if strings.TrimSpace(opts.Reason) == "" {
 			return errors.New("-unhalt requires -reason")
@@ -342,15 +359,36 @@ func openDB(ctx context.Context, cfg config.Config) (*sqlx.DB, error) {
 func buildGateway(ctx context.Context, cfg config.Config, log *slog.Logger) (tinvest.Gateway, func(), error) {
 	switch cfg.App.Mode {
 	case domain.ModePaper:
+		if cfg.TInvest.Token != "" {
+			accountID := cfg.TInvest.AccountID
+			if accountID == "" {
+				accountID = "paper-readonly"
+			}
+			gw, err := tinvest.NewRealGateway(ctx, tinvest.Options{
+				Token:          cfg.TInvest.Token,
+				AccountID:      accountID,
+				Endpoint:       cfg.TInvest.Endpoint,
+				AppName:        cfg.TInvest.AppName,
+				RequestTimeout: time.Duration(cfg.TInvest.RequestTimeoutSec) * time.Second,
+				RetryCount:     cfg.TInvest.RetryCount,
+				RetryBackoff:   time.Duration(cfg.TInvest.RetryBackoffSec) * time.Second,
+				Logger:         log,
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			return tinvest.NewPaperGateway(gw), func() { _ = gw.Close() }, nil
+		}
 		return tinvest.NewFakeGateway(), nil, nil
 	case domain.ModeSandbox:
 		gw, err := tinvest.NewSandboxGateway(ctx, tinvest.Options{
-			Token:        cfg.TInvest.Token,
-			AccountID:    cfg.TInvest.AccountID,
-			AppName:      cfg.TInvest.AppName,
-			RetryCount:   cfg.TInvest.RetryCount,
-			RetryBackoff: time.Duration(cfg.TInvest.RetryBackoffSec) * time.Second,
-			Logger:       log,
+			Token:          cfg.TInvest.Token,
+			AccountID:      cfg.TInvest.AccountID,
+			AppName:        cfg.TInvest.AppName,
+			RequestTimeout: time.Duration(cfg.TInvest.RequestTimeoutSec) * time.Second,
+			RetryCount:     cfg.TInvest.RetryCount,
+			RetryBackoff:   time.Duration(cfg.TInvest.RetryBackoffSec) * time.Second,
+			Logger:         log,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -362,13 +400,14 @@ func buildGateway(ctx context.Context, cfg config.Config, log *slog.Logger) (tin
 			return nil, nil, errors.New("TINVEST_USE_SANDBOX is only allowed with APP_MODE=sandbox")
 		}
 		gw, err := tinvest.NewRealGateway(ctx, tinvest.Options{
-			Token:        cfg.TInvest.Token,
-			AccountID:    cfg.TInvest.AccountID,
-			Endpoint:     endpoint,
-			AppName:      cfg.TInvest.AppName,
-			RetryCount:   cfg.TInvest.RetryCount,
-			RetryBackoff: time.Duration(cfg.TInvest.RetryBackoffSec) * time.Second,
-			Logger:       log,
+			Token:          cfg.TInvest.Token,
+			AccountID:      cfg.TInvest.AccountID,
+			Endpoint:       endpoint,
+			AppName:        cfg.TInvest.AppName,
+			RequestTimeout: time.Duration(cfg.TInvest.RequestTimeoutSec) * time.Second,
+			RetryCount:     cfg.TInvest.RetryCount,
+			RetryBackoff:   time.Duration(cfg.TInvest.RetryBackoffSec) * time.Second,
+			Logger:         log,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -384,7 +423,11 @@ func seedPaperGateway(ctx context.Context, repo interface {
 }, gateway tinvest.Gateway) error {
 	fake, ok := gateway.(*tinvest.FakeGateway)
 	if !ok {
-		return nil
+		paper, isPaper := gateway.(*tinvest.PaperGateway)
+		if !isPaper {
+			return nil
+		}
+		fake = paper.Fake()
 	}
 	instrumentsList, err := repo.ListInstruments(ctx, true)
 	if err != nil {

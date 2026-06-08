@@ -24,9 +24,12 @@ func (r Registry) SyncMetadata(ctx context.Context) error {
 		return err
 	}
 	for _, instrument := range instruments {
+		if !instrument.Enabled || instrument.Quarantine {
+			continue
+		}
 		remote, err := r.gateway.GetInstrument(ctx, instrument.Ticker, instrument.ClassCode)
 		if err != nil {
-			return fmt.Errorf("sync %s: %w", instrument.Ticker, err)
+			continue
 		}
 		remote.Enabled = instrument.Enabled && remote.Enabled
 		remote.FundType = instrument.FundType
