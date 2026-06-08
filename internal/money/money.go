@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrInvalidTick = errors.New("tick must be positive")
-	ErrInvalidBase = errors.New("base must be positive")
+	ErrInvalidTick      = errors.New("tick must be positive")
+	ErrInvalidBase      = errors.New("base must be positive")
+	ErrInvalidQuotation = errors.New("decimal cannot be represented as protobuf quotation")
 )
 
 type RoundMode int
@@ -28,7 +29,7 @@ func QuotationToDecimal(q *pb.Quotation) decimal.Decimal {
 	return decimal.NewFromInt(q.GetUnits()).Add(decimal.New(int64(q.GetNano()), -9))
 }
 
-func DecimalToQuotation(d decimal.Decimal) *pb.Quotation {
+func DecimalToQuotation(d decimal.Decimal) (*pb.Quotation, error) {
 	units := d.Truncate(0)
 	nano := d.Sub(units).Mul(decimal.NewFromInt(1_000_000_000)).Round(0)
 	if nano.Equal(decimal.NewFromInt(1_000_000_000)) {
@@ -41,12 +42,12 @@ func DecimalToQuotation(d decimal.Decimal) *pb.Quotation {
 	}
 	nanoPart := nano.IntPart()
 	if nanoPart < -999_999_999 || nanoPart > 999_999_999 {
-		panic("decimal quotation nano is out of protobuf range")
+		return nil, ErrInvalidQuotation
 	}
 	return &pb.Quotation{
 		Units: units.IntPart(),
 		Nano:  int32(nanoPart), // #nosec G115 -- nanoPart is bounded above.
-	}
+	}, nil
 }
 
 func MoneyValueToDecimal(v *pb.MoneyValue) decimal.Decimal {

@@ -109,14 +109,14 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 	}
 	short := Rolling(overnight, cfg.RollingShort, cfg.EWMALambda)
 	long := Rolling(overnight, cfg.RollingLong, cfg.EWMALambda)
+	q05Abs := rollingQ05Abs(overnight, cfg.RollingShort)
 	adv := ADV(candles, instrument.Lot, 20)
 	rawEdgeBps := decimal.NewFromFloat(short.Mean).Mul(decimal.NewFromInt(10_000))
-	instrumentCommission := instrument.ExpectedCommissionBpsPerSide.Mul(decimal.NewFromInt(2))
+	commission := roundTripCommissionBps(instrument, cfg)
 	expectedCost := spread.SpreadBps.
 		Add(cfg.EntrySlippageBps).
 		Add(cfg.ExitSlippageBps).
-		Add(cfg.CommissionRoundtripBps).
-		Add(instrumentCommission).
+		Add(commission).
 		Add(cfg.RiskBufferBps)
 	return domain.FeatureSet{
 		InstrumentUID:       instrument.InstrumentUID,
@@ -126,6 +126,7 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 		MuOn60:              decimal.NewFromFloat(short.Mean),
 		MuOn252:             decimal.NewFromFloat(long.Mean),
 		SigmaOn60:           decimal.NewFromFloat(short.StdDev),
+		Q05On60Abs:          q05Abs,
 		TStatOn60:           decimal.NewFromFloat(short.TStat),
 		WinOn60:             decimal.NewFromFloat(short.WinRate),
 		EWMAOn:              decimal.NewFromFloat(short.EWMA),
@@ -139,6 +140,26 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 		ExitIntervalVolume:  exitVolume,
 		CalculatedAt:        time.Now().UTC(),
 	}, nil
+}
+
+func rollingQ05Abs(values []float64, window int) decimal.Decimal {
+	if window <= 0 || len(values) < window {
+		return decimal.Zero
+	}
+	sample := values[len(values)-window:]
+	q05 := decimal.NewFromFloat(Quantile(sample, 0.05))
+	if q05.IsNegative() {
+		return q05.Neg()
+	}
+	return q05
+}
+
+func roundTripCommissionBps(instrument domain.Instrument, cfg PipelineConfig) decimal.Decimal {
+	instrumentCommission := instrument.ExpectedCommissionBpsPerSide.Mul(decimal.NewFromInt(2))
+	if instrumentCommission.IsPositive() {
+		return instrumentCommission
+	}
+	return cfg.CommissionRoundtripBps
 }
 
 func historicalDailyCandles(candles []domain.Candle, tradeDate time.Time) []domain.Candle {

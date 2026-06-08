@@ -9,6 +9,7 @@ import (
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/repository"
+	"overnight-trading-bot/internal/risk"
 )
 
 var _ repository.Repository = (*MemoryRepository)(nil)
@@ -260,6 +261,20 @@ func (r *MemoryRepository) IncrementFreeOrders(_ context.Context, tradeDate time
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.FreeOrders[featureKey(instrumentUID, tradeDate)] += delta
+	return nil
+}
+
+func (r *MemoryRepository) ReserveFreeOrders(_ context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if delta <= 0 {
+		return nil
+	}
+	key := featureKey(instrumentUID, tradeDate)
+	if limit > 0 && r.FreeOrders[key]+delta > limit {
+		return risk.ErrFreeOrderBudget
+	}
+	r.FreeOrders[key] += delta
 	return nil
 }
 

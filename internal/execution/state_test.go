@@ -2,15 +2,29 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/shopspring/decimal"
 
 	"overnight-trading-bot/internal/domain"
+	"overnight-trading-bot/internal/risk"
 	"overnight-trading-bot/internal/testutil"
 	"overnight-trading-bot/internal/tinvest"
 )
+
+type fixedClock struct {
+	now time.Time
+}
+
+func (c *fixedClock) Now() time.Time {
+	return c.now
+}
+
+func (c *fixedClock) Sleep(<-chan struct{}, time.Duration) bool {
+	return true
+}
 
 func TestClientOrderIDIncludesAttempt(t *testing.T) {
 	date := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
@@ -63,6 +77,86 @@ func TestPlaceLimitSuppressesDuplicateSubmit(t *testing.T) {
 	}
 	if sent != 1 {
 		t.Fatalf("free order counter=%d, want 1", sent)
+	}
+}
+
+func TestPlaceEntryReservesFreeOrderBudgetAtomically(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: 1,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	if _, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 1, book, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 1, book, 1, 2)
+	if !errors.Is(err, risk.ErrFreeOrderBudget) {
+		t.Fatalf("expected free order budget error, got %v", err)
+	}
+	if got := len(gateway.Orders); got != 1 {
+		t.Fatalf("broker orders=%d, want no second post", got)
+	}
+}
+
+func TestMonitorOnceUsesInjectedClockForDeadline(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	clock := &fixedClock{now: time.Date(2030, 1, 1, 10, 0, 0, 0, time.UTC)}
+	engine.SetClock(clock)
+	order, err := engine.PlaceLimit(ctx, domain.Order{
+		ClientOrderID: "clocked",
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		TradeDate:     clock.now,
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    decimal.NewFromInt(100),
+		QuantityLots:  1,
+		Status:        domain.OrderStatusNew,
+		AttemptNo:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !order.CreatedAt.Equal(clock.now) {
+		t.Fatalf("created_at=%s, want injected clock %s", order.CreatedAt, clock.now)
+	}
+	monitored, err := engine.MonitorOnce(ctx, order, MonitorConfig{
+		Deadline:     clock.now.Add(time.Minute),
+		PollInterval: time.Millisecond,
+		MaxAttempts:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if monitored.Status == domain.OrderStatusExpired {
+		t.Fatalf("order expired before injected deadline: %+v", monitored)
+	}
+	clock.now = clock.now.Add(time.Minute)
+	monitored, err = engine.MonitorOnce(ctx, order, MonitorConfig{
+		Deadline:     clock.now,
+		PollInterval: time.Millisecond,
+		MaxAttempts:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if monitored.Status != domain.OrderStatusExpired {
+		t.Fatalf("status=%s, want EXPIRED at injected deadline", monitored.Status)
 	}
 }
 

@@ -41,12 +41,91 @@ func TestComputeExpectedCostIncludesCommissionAndSlippage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(26)) {
-		t.Fatalf("expected cost=%s, want 26", got.ExpectedCostBps)
+	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(22)) {
+		t.Fatalf("expected cost=%s, want 22", got.ExpectedCostBps)
 	}
 	if !got.EntryIntervalVolume.Equal(decimal.NewFromInt(10000)) || !got.ExitIntervalVolume.Equal(decimal.NewFromInt(9000)) {
 		t.Fatalf("interval volumes were not preserved: %+v", got)
 	}
+}
+
+func TestComputeExpectedCostFallsBackToConfigCommission(t *testing.T) {
+	candles := flatCandles(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), 6)
+	got, err := Compute(domain.Instrument{
+		InstrumentUID: "uid",
+		Lot:           1,
+	}, candles, candles[5].TradeDate, SpreadResult{SpreadBps: decimal.NewFromInt(10)}, PipelineConfig{
+		RollingShort:           2,
+		RollingLong:            2,
+		EWMALambda:             0.08,
+		RiskBufferBps:          decimal.NewFromInt(5),
+		EntrySlippageBps:       decimal.NewFromInt(2),
+		ExitSlippageBps:        decimal.NewFromInt(3),
+		CommissionRoundtripBps: decimal.NewFromInt(4),
+	}, decimal.Zero, decimal.Zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(24)) {
+		t.Fatalf("expected cost=%s, want 24", got.ExpectedCostBps)
+	}
+}
+
+func TestComputeStoresHistoricalQ05Abs(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	returns := []string{"-0.10", "0.01", "0.02", "0.03", "0.04"}
+	candles := []domain.Candle{{
+		InstrumentUID: "uid",
+		TradeDate:     start,
+		Open:          decimal.NewFromInt(100),
+		Close:         decimal.NewFromInt(100),
+		VolumeLots:    decimal.NewFromInt(1),
+	}}
+	for i, raw := range returns {
+		r, err := decimal.NewFromString(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		open := decimal.NewFromInt(100).Mul(decimal.NewFromInt(1).Add(r))
+		candles = append(candles, domain.Candle{
+			InstrumentUID: "uid",
+			TradeDate:     start.AddDate(0, 0, i+1),
+			Open:          open,
+			Close:         decimal.NewFromInt(100),
+			VolumeLots:    decimal.NewFromInt(1),
+		})
+	}
+	got, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, start.AddDate(0, 0, 6), SpreadResult{}, PipelineConfig{
+		RollingShort: 5,
+		RollingLong:  5,
+		EWMALambda:   0.08,
+	}, decimal.Zero, decimal.Zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decimal.NewFromFloat(0.078)
+	diff := got.Q05On60Abs.Sub(want)
+	if diff.IsNegative() {
+		diff = diff.Neg()
+	}
+	if diff.GreaterThan(decimal.NewFromFloat(0.000001)) {
+		t.Fatalf("Q05On60Abs=%s, want about %s", got.Q05On60Abs, want)
+	}
+}
+
+func flatCandles(start time.Time, count int) []domain.Candle {
+	candles := make([]domain.Candle, 0, count)
+	for i := 0; i < count; i++ {
+		price := decimal.NewFromInt(int64(100 + i))
+		candles = append(candles, domain.Candle{
+			InstrumentUID: "uid",
+			TradeDate:     start.AddDate(0, 0, i),
+			Open:          price,
+			Close:         price,
+			VolumeLots:    decimal.NewFromInt(1000),
+		})
+	}
+	return candles
 }
 
 func TestIntervalVolume(t *testing.T) {

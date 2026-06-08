@@ -171,6 +171,50 @@ func TestReconciliationSkipsFreshInFlightLocalOrders(t *testing.T) {
 	}
 }
 
+func TestReconciliationUsesInjectedClockForInFlightGrace(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	clock := &fixedClock{now: time.Date(2000, 1, 1, 10, 0, 0, 0, time.UTC)}
+	if err := repo.UpsertOrder(ctx, domain.Order{
+		ClientOrderID: "fresh",
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		TradeDate:     clock.now,
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		QuantityLots:  1,
+		Status:        domain.OrderStatusSent,
+		CreatedAt:     clock.now.Add(-5 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	diffs, err := New(repo, gateway, "account", "hash").
+		WithClock(clock).
+		WithInFlightGrace(10 * time.Second).
+		Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, diff := range diffs {
+		if diff.Kind == "local_order_without_broker_id" || diff.Kind == "missing_local_order" {
+			t.Fatalf("fresh in-flight order produced diff: %+v", diffs)
+		}
+	}
+}
+
+type fixedClock struct {
+	now time.Time
+}
+
+func (c *fixedClock) Now() time.Time {
+	return c.now
+}
+
+func (c *fixedClock) Sleep(<-chan struct{}, time.Duration) bool {
+	return true
+}
+
 func TestReconciliationFindsCashMismatch(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

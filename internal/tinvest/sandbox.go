@@ -39,11 +39,15 @@ func (g *SandboxGateway) PostLimitOrder(ctx context.Context, accountID, instrume
 	if side == domain.SideSell {
 		direction = pb.OrderDirection_ORDER_DIRECTION_SELL
 	}
+	quotation, err := money.DecimalToQuotation(price)
+	if err != nil {
+		return domain.Order{}, err
+	}
 	resp, err := retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.PostOrderResponse, error) {
 		return g.sandbox.PostSandboxOrder(&investgo.PostOrderRequest{
 			InstrumentId: instrumentUID,
 			Quantity:     lots,
-			Price:        money.DecimalToQuotation(price),
+			Price:        quotation,
 			Direction:    direction,
 			AccountId:    accountID,
 			OrderType:    pb.OrderType_ORDER_TYPE_LIMIT,

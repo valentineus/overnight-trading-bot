@@ -13,6 +13,7 @@ import (
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/money"
 	"overnight-trading-bot/internal/repository"
+	"overnight-trading-bot/internal/timeutil"
 	"overnight-trading-bot/internal/tinvest"
 )
 
@@ -29,6 +30,7 @@ type Engine struct {
 	commissionTolerance   decimal.Decimal
 	requireZeroCommission bool
 	quarantineOnNonZero   bool
+	clock                 timeutil.Clock
 }
 
 func New(repo repository.Repository, gateway tinvest.Gateway, accountID, accountIDHash string) Engine {
@@ -40,6 +42,7 @@ func New(repo repository.Repository, gateway tinvest.Gateway, accountID, account
 		accountIDHash:       accountIDHash,
 		window:              72 * time.Hour,
 		commissionTolerance: defaultCommissionTolerance,
+		clock:               timeutil.RealClock{},
 	}
 }
 
@@ -66,6 +69,13 @@ func (e Engine) WithCommissionPolicy(requireZero, quarantineOnNonZero bool, tole
 	return e
 }
 
+func (e Engine) WithClock(clock timeutil.Clock) Engine {
+	if clock != nil {
+		e.clock = clock
+	}
+	return e
+}
+
 func (e Engine) Run(ctx context.Context) ([]domain.ReconciliationDiff, error) {
 	if e.mu != nil {
 		e.mu.Lock()
@@ -79,7 +89,7 @@ func (e Engine) Run(ctx context.Context) ([]domain.ReconciliationDiff, error) {
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
+	now := e.nowUTC()
 	localByBroker := make(map[string]domain.Order, len(localOrders))
 	brokerByID := make(map[string]domain.Order, len(brokerOrders))
 	for _, order := range localOrders {
@@ -175,7 +185,7 @@ func (e Engine) Run(ctx context.Context) ([]domain.ReconciliationDiff, error) {
 			}
 			if err := e.repo.QuarantineInstrument(ctx, diff.InstrumentUID, diff.Message); err != nil {
 				_ = e.repo.InsertRiskEvent(ctx, domain.RiskEvent{
-					TS:            time.Now().UTC(),
+					TS:            now,
 					Severity:      domain.SeverityCritical,
 					EventType:     "quarantine_failed",
 					InstrumentUID: diff.InstrumentUID,
@@ -190,6 +200,13 @@ func (e Engine) Run(ctx context.Context) ([]domain.ReconciliationDiff, error) {
 		return nil, err
 	}
 	return diffs, nil
+}
+
+func (e Engine) nowUTC() time.Time {
+	if e.clock == nil {
+		return time.Now().UTC()
+	}
+	return e.clock.Now().UTC()
 }
 
 func (e Engine) isInFlight(order domain.Order, now time.Time) bool {

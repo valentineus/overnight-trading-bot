@@ -57,6 +57,7 @@ type featureRow struct {
 	MuOn60              decimal.Decimal `db:"mu_on_60"`
 	MuOn252             decimal.Decimal `db:"mu_on_252"`
 	SigmaOn60           decimal.Decimal `db:"sigma_on_60"`
+	Q05On60Abs          decimal.Decimal `db:"q05_on_60_abs"`
 	TStatOn60           decimal.Decimal `db:"tstat_on_60"`
 	WinOn60             decimal.Decimal `db:"win_on_60"`
 	EWMAOn              decimal.Decimal `db:"ewma_on"`
@@ -80,6 +81,7 @@ func featureRowFromDomain(feature domain.FeatureSet) featureRow {
 		MuOn60:              feature.MuOn60,
 		MuOn252:             feature.MuOn252,
 		SigmaOn60:           feature.SigmaOn60,
+		Q05On60Abs:          feature.Q05On60Abs,
 		TStatOn60:           feature.TStatOn60,
 		WinOn60:             feature.WinOn60,
 		EWMAOn:              feature.EWMAOn,
@@ -104,6 +106,7 @@ func (r featureRow) domain() domain.FeatureSet {
 		MuOn60:              r.MuOn60,
 		MuOn252:             r.MuOn252,
 		SigmaOn60:           r.SigmaOn60,
+		Q05On60Abs:          r.Q05On60Abs,
 		TStatOn60:           r.TStatOn60,
 		WinOn60:             r.WinOn60,
 		EWMAOn:              r.EWMAOn,

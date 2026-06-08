@@ -175,6 +175,7 @@ type FeatureSet struct {
 	MuOn60              decimal.Decimal
 	MuOn252             decimal.Decimal
 	SigmaOn60           decimal.Decimal
+	Q05On60Abs          decimal.Decimal
 	TStatOn60           decimal.Decimal
 	WinOn60             decimal.Decimal
 	EWMAOn              decimal.Decimal

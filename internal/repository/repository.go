@@ -38,6 +38,7 @@ type Repository interface {
 	InsertRiskEvent(ctx context.Context, event domain.RiskEvent) error
 	GetFreeOrdersSent(ctx context.Context, tradeDate time.Time, instrumentUID string) (int, error)
 	IncrementFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int) error
+	ReserveFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error
 
 	GetSystemState(ctx context.Context) (domain.SystemState, bool, string, error)
 	SaveSystemState(ctx context.Context, state domain.SystemState, mode domain.Mode, halted bool, reason string, contextJSON string) error

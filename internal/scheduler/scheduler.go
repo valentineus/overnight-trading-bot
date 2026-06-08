@@ -130,6 +130,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
+func (s Scheduler) GracefulShutdown(ctx context.Context) error {
+	if s.svc.Repo == nil || s.svc.Execution == nil {
+		return nil
+	}
+	if err := s.cancelActiveOrders(ctx, domain.SideBuy, domain.OrderStatusCancelled, "shutdown_cancel_active_orders"); err != nil {
+		return err
+	}
+	return s.cancelActiveOrders(ctx, domain.SideSell, domain.OrderStatusCancelled, "shutdown_cancel_active_orders")
+}
+
 func (s *Scheduler) Step(ctx context.Context) error {
 	if err := s.checkInfrastructure(ctx); err != nil {
 		return err
@@ -370,7 +380,7 @@ func (s Scheduler) sizeSignal(portfolio domain.Portfolio, instrument domain.Inst
 		Lot:                 instrument.Lot,
 		EntryIntervalVolume: feature.EntryIntervalVolume,
 		ExitIntervalVolume:  feature.ExitIntervalVolume,
-		Q05OvernightAbs:     money.Abs(feature.SigmaOn60).Mul(decimal.NewFromFloat(1.65)),
+		Q05OvernightAbs:     feature.Q05On60Abs,
 	}), nil
 }
 
@@ -544,7 +554,7 @@ func (s *Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error
 				return s.svc.MarketData.LatestQuote(ctx, instrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
 			},
 			RepostCheck: func(ctx context.Context, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error {
-				return s.repostPreTradeCheck(ctx, now, order, instrument, book)
+				return s.repostPreTradeCheck(ctx, s.nowUTC().In(s.cfg.Location), order, instrument, book)
 			},
 		})
 		if err != nil {
@@ -570,7 +580,29 @@ func (s *Scheduler) holdOvernight(ctx context.Context) error {
 	if err := s.closeEntryWindow(ctx); err != nil {
 		return err
 	}
+	if err := s.promoteEntryFilledPositions(ctx); err != nil {
+		return err
+	}
 	return s.periodicReconcile(ctx)
+}
+
+func (s Scheduler) promoteEntryFilledPositions(ctx context.Context) error {
+	positionsList, err := s.svc.Repo.ListOpenPositions(ctx, s.svc.AccountIDHash)
+	if err != nil {
+		return err
+	}
+	now := s.nowUTC()
+	for _, pos := range positionsList {
+		if pos.Status != domain.PositionEntryFilled {
+			continue
+		}
+		pos.Status = domain.PositionHoldingOvernight
+		pos.UpdatedAt = now
+		if err := s.svc.Repo.UpsertPosition(ctx, pos); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
@@ -694,7 +726,7 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 				return s.svc.MarketData.LatestQuote(ctx, instrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
 			},
 			RepostCheck: func(ctx context.Context, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error {
-				return s.repostPreTradeCheck(ctx, now, order, instrument, book)
+				return s.repostPreTradeCheck(ctx, s.nowUTC().In(s.cfg.Location), order, instrument, book)
 			},
 		})
 		if err != nil {
@@ -1080,7 +1112,7 @@ func (s *Scheduler) failOpenPositionsAtHardDeadline(ctx context.Context) error {
 	now := s.nowUTC()
 	for _, pos := range positionsList {
 		switch pos.Status {
-		case domain.PositionHoldingOvernight, domain.PositionExitPartiallyFilled, domain.PositionExitOrderSent:
+		case domain.PositionEntryFilled, domain.PositionHoldingOvernight, domain.PositionExitPartiallyFilled, domain.PositionExitOrderSent:
 			pos.Status = domain.PositionExitFailed
 			pos.UpdatedAt = now
 			if err := s.svc.Repo.UpsertPosition(ctx, pos); err != nil {

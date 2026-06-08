@@ -37,3 +37,18 @@ func TestRoundToTick(t *testing.T) {
 		}
 	}
 }
+
+func TestDecimalToQuotationHandlesRoundingCarry(t *testing.T) {
+	tooPrecise := d("0.0000000005")
+	if _, err := DecimalToQuotation(tooPrecise); err != nil {
+		t.Fatalf("roundable quotation returned error: %v", err)
+	}
+	hugeNano := d("0.9999999996")
+	got, err := DecimalToQuotation(hugeNano)
+	if err != nil {
+		t.Fatalf("carry quotation returned error: %v", err)
+	}
+	if got.Units != 1 || got.Nano != 0 {
+		t.Fatalf("quotation=%+v, want carry to 1/0", got)
+	}
+}

@@ -49,7 +49,7 @@ func run() error {
 	defer func() {
 		_ = file.Close()
 	}()
-	candles, err := backtest.LoadCandlesCSV(file)
+	candles, metadata, err := backtest.LoadCandlesCSVWithMetadata(file)
 	if err != nil {
 		return fmt.Errorf("load candles: %w", err)
 	}
@@ -62,10 +62,12 @@ func run() error {
 		defer func() {
 			_ = minuteFile.Close()
 		}()
-		minuteCandles, err = backtest.LoadCandlesCSV(minuteFile)
+		var minuteMetadata map[string]backtest.InstrumentMetadata
+		minuteCandles, minuteMetadata, err = backtest.LoadCandlesCSVWithMetadata(minuteFile)
 		if err != nil {
 			return fmt.Errorf("load minute candles: %w", err)
 		}
+		mergeMetadata(metadata, minuteMetadata)
 	}
 	if *useMinuteModel && len(minuteCandles) == 0 {
 		return fmt.Errorf("-minute-candles is required when -use-minute-model=true")
@@ -114,24 +116,27 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("max tick: %w", err)
 	}
+	lotsByInstrument, ticksByInstrument := metadataMaps(metadata)
 	engine := backtest.New(backtest.Config{
-		EntrySlippageBps:       entry,
-		ExitSlippageBps:        exit,
-		CommissionRoundtripBps: comm,
-		RiskBufferBps:          riskBuf,
-		OutputDir:              *outputDir,
-		RollingShort:           *rollingShort,
-		RollingLong:            *rollingLong,
-		EWMALambda:             *ewmaLambda,
-		MinTStat60:             tstat,
-		MinWinRate60:           winRate,
-		MinNetEdgeBps:          netEdge,
-		MinADVRUB:              adv,
-		MaxSpreadBps:           spread,
-		MaxTickBps:             tick,
-		AssumedSpreadBps:       assumed,
-		RequireZeroCommission:  requireZeroCommission,
-		UseMinuteModel:         *useMinuteModel,
+		EntrySlippageBps:               entry,
+		ExitSlippageBps:                exit,
+		CommissionRoundtripBps:         comm,
+		RiskBufferBps:                  riskBuf,
+		OutputDir:                      *outputDir,
+		RollingShort:                   *rollingShort,
+		RollingLong:                    *rollingLong,
+		EWMALambda:                     *ewmaLambda,
+		MinTStat60:                     tstat,
+		MinWinRate60:                   winRate,
+		MinNetEdgeBps:                  netEdge,
+		MinADVRUB:                      adv,
+		MaxSpreadBps:                   spread,
+		MaxTickBps:                     tick,
+		AssumedSpreadBps:               assumed,
+		RequireZeroCommission:          requireZeroCommission,
+		LotsByInstrument:               lotsByInstrument,
+		MinPriceIncrementsByInstrument: ticksByInstrument,
+		UseMinuteModel:                 *useMinuteModel,
 	})
 	result, err := engine.RunWithMinuteCandles(candles, minuteCandles)
 	if err != nil {
@@ -142,4 +147,33 @@ func run() error {
 	}
 	fmt.Printf("backtest complete: trades=%d total_return=%.6f\n", result.Metrics.NumberOfTrades, result.Metrics.TotalReturn)
 	return nil
+}
+
+func mergeMetadata(dst, src map[string]backtest.InstrumentMetadata) {
+	for uid, meta := range src {
+		current := dst[uid]
+		if current.Lot <= 0 {
+			current.Lot = meta.Lot
+		}
+		if !current.MinPriceIncrement.IsPositive() {
+			current.MinPriceIncrement = meta.MinPriceIncrement
+		}
+		if current.Lot > 0 || current.MinPriceIncrement.IsPositive() {
+			dst[uid] = current
+		}
+	}
+}
+
+func metadataMaps(metadata map[string]backtest.InstrumentMetadata) (map[string]int64, map[string]decimal.Decimal) {
+	lots := make(map[string]int64)
+	ticks := make(map[string]decimal.Decimal)
+	for uid, meta := range metadata {
+		if meta.Lot > 0 {
+			lots[uid] = meta.Lot
+		}
+		if meta.MinPriceIncrement.IsPositive() {
+			ticks[uid] = meta.MinPriceIncrement
+		}
+	}
+	return lots, ticks
 }

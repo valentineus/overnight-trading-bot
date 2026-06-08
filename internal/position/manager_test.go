@@ -28,6 +28,9 @@ func TestOnEntryFillKeepsBuyCommission(t *testing.T) {
 	if !pos.CommissionTotal.Equal(decimal.NewFromInt(3)) {
 		t.Fatalf("commission=%s, want 3", pos.CommissionTotal)
 	}
+	if pos.Status != domain.PositionEntryFilled {
+		t.Fatalf("status=%s, want ENTRY_FILLED", pos.Status)
+	}
 }
 
 func TestOnExitFillPartialUsesExecutedLots(t *testing.T) {

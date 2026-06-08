@@ -114,10 +114,12 @@ func Run(ctx context.Context, opts Options) error {
 			defer closer()
 		}
 		accountIDHash := accountHash(cfg.TInvest.AccountID)
+		clock := timeutil.RealClock{Loc: cfg.Location}
 		recon := reconciliation.New(repo, gateway, cfg.TInvest.AccountID, accountIDHash).
 			WithWindow(time.Duration(cfg.Risk.ReconciliationWindowHours)*time.Hour).
 			WithInFlightGrace(time.Duration(cfg.Risk.ReconciliationSkewSec)*time.Second).
-			WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB)
+			WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB).
+			WithClock(clock)
 		diffs, err := recon.Run(ctx)
 		if err != nil {
 			return fmt.Errorf("pre-unhalt reconciliation: %w", err)
@@ -159,10 +161,12 @@ func Run(ctx context.Context, opts Options) error {
 	}()
 
 	accountIDHash := accountHash(cfg.TInvest.AccountID)
+	clock := timeutil.RealClock{Loc: cfg.Location}
 	recon := reconciliation.New(repo, gateway, cfg.TInvest.AccountID, accountIDHash).
 		WithWindow(time.Duration(cfg.Risk.ReconciliationWindowHours)*time.Hour).
 		WithInFlightGrace(time.Duration(cfg.Risk.ReconciliationSkewSec)*time.Second).
-		WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB)
+		WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB).
+		WithClock(clock)
 	sm := statemachine.New(repo, cfg.App.Mode)
 	if _, err := sm.Recover(ctx, recon); err != nil {
 		_ = notifier.Alert(ctx, fmt.Sprintf("state recovery failed: %s", err))
@@ -184,14 +188,25 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	clock := timeutil.RealClock{Loc: cfg.Location}
 	runtime := buildScheduler(clock, sm, cfg, repo, gateway, notifier, recon, accountIDHash, log)
-	return runtime.Run(runCtx)
+	if err := runtime.Run(runCtx); err != nil {
+		if runCtx.Err() == nil {
+			return err
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.App.ShutdownTimeoutSec)*time.Second)
+		defer cancel()
+		if shutdownErr := runtime.GracefulShutdown(shutdownCtx); shutdownErr != nil {
+			return fmt.Errorf("%w; graceful shutdown: %v", err, shutdownErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Config, repo *mysqlrepo.Repository, gateway tinvest.Gateway, notifier notify.Notifier, recon reconciliation.Engine, accountIDHash string, log *slog.Logger) scheduler.Scheduler {
 	registry := instruments.NewRegistry(repo, gateway)
 	loader := marketdata.NewLoader(repo, gateway)
+	loader.SetClock(clock)
 	pipeline := features.NewPipeline(repo, features.PipelineConfig{
 		RollingShort:           cfg.Strategy.RollingShort,
 		RollingLong:            cfg.Strategy.RollingLong,
@@ -243,6 +258,7 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 		MaxQuoteAge:               time.Duration(cfg.Execution.MaxQuoteAgeSec) * time.Second,
 	})
 	execEngine := execution.NewEngine(cfg.App.Mode, cfg.TInvest.AccountID, gateway, repo)
+	execEngine.SetClock(clock)
 	execEngine.SetMaxQuoteAge(time.Duration(cfg.Execution.MaxQuoteAgeSec) * time.Second)
 	execEngine.SetFreeOrderCountPolicy(cfg.Commission.FreeOrderCountPolicy)
 	services := scheduler.Services{

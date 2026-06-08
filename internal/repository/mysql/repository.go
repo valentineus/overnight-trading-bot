@@ -13,6 +13,7 @@ import (
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/repository"
+	"overnight-trading-bot/internal/risk"
 )
 
 var _ repository.Repository = (*Repository)(nil)
@@ -224,13 +225,13 @@ ON DUPLICATE KEY UPDATE
 func (r *Repository) mergeFeatures(ctx context.Context, oldInstrumentUID, newInstrumentUID string) error {
 	_, err := r.execer().ExecContext(ctx, `
 INSERT INTO features (
-  instrument_uid, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60,
+  instrument_uid, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60, q05_on_60_abs,
   tstat_on_60, win_on_60, ewma_on, spread_bps, half_spread_bps, tick_bps,
   adv_20, expected_cost_bps, net_edge_bps, entry_interval_volume,
   exit_interval_volume, calculated_at
 )
 SELECT
-  ?, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60,
+  ?, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60, q05_on_60_abs,
   tstat_on_60, win_on_60, ewma_on, spread_bps, half_spread_bps, tick_bps,
   adv_20, expected_cost_bps, net_edge_bps, entry_interval_volume,
   exit_interval_volume, calculated_at
@@ -238,7 +239,7 @@ FROM features WHERE instrument_uid=?
 ON DUPLICATE KEY UPDATE
   r_on=VALUES(r_on), r_day=VALUES(r_day), mu_on_60=VALUES(mu_on_60),
   mu_on_252=VALUES(mu_on_252), sigma_on_60=VALUES(sigma_on_60),
-  tstat_on_60=VALUES(tstat_on_60), win_on_60=VALUES(win_on_60),
+  q05_on_60_abs=VALUES(q05_on_60_abs), tstat_on_60=VALUES(tstat_on_60), win_on_60=VALUES(win_on_60),
   ewma_on=VALUES(ewma_on), spread_bps=VALUES(spread_bps),
   half_spread_bps=VALUES(half_spread_bps), tick_bps=VALUES(tick_bps),
   adv_20=VALUES(adv_20), expected_cost_bps=VALUES(expected_cost_bps),
@@ -385,19 +386,19 @@ func (r *Repository) UpsertFeature(ctx context.Context, feature domain.FeatureSe
 	}
 	_, err := sqlx.NamedExecContext(ctx, r.execer(), `
 INSERT INTO features (
-  instrument_uid, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60,
+  instrument_uid, trade_date, r_on, r_day, mu_on_60, mu_on_252, sigma_on_60, q05_on_60_abs,
   tstat_on_60, win_on_60, ewma_on, spread_bps, half_spread_bps, tick_bps,
   adv_20, expected_cost_bps, net_edge_bps, entry_interval_volume,
   exit_interval_volume, calculated_at
 ) VALUES (
-  :instrument_uid, :trade_date, :r_on, :r_day, :mu_on_60, :mu_on_252, :sigma_on_60,
+  :instrument_uid, :trade_date, :r_on, :r_day, :mu_on_60, :mu_on_252, :sigma_on_60, :q05_on_60_abs,
   :tstat_on_60, :win_on_60, :ewma_on, :spread_bps, :half_spread_bps, :tick_bps,
   :adv_20, :expected_cost_bps, :net_edge_bps, :entry_interval_volume,
   :exit_interval_volume, :calculated_at
 ) ON DUPLICATE KEY UPDATE
   r_on=VALUES(r_on), r_day=VALUES(r_day), mu_on_60=VALUES(mu_on_60),
   mu_on_252=VALUES(mu_on_252), sigma_on_60=VALUES(sigma_on_60),
-  tstat_on_60=VALUES(tstat_on_60), win_on_60=VALUES(win_on_60),
+  q05_on_60_abs=VALUES(q05_on_60_abs), tstat_on_60=VALUES(tstat_on_60), win_on_60=VALUES(win_on_60),
   ewma_on=VALUES(ewma_on), spread_bps=VALUES(spread_bps),
   half_spread_bps=VALUES(half_spread_bps), tick_bps=VALUES(tick_bps),
   adv_20=VALUES(adv_20), expected_cost_bps=VALUES(expected_cost_bps),
@@ -453,7 +454,9 @@ func (r *Repository) UpsertOrder(ctx context.Context, order domain.Order) error 
 	if order.CreatedAt.IsZero() {
 		order.CreatedAt = now
 	}
-	order.UpdatedAt = now
+	if order.UpdatedAt.IsZero() {
+		order.UpdatedAt = now
+	}
 	if order.RawStateJSON == "" {
 		order.RawStateJSON = "{}"
 	}
@@ -593,6 +596,47 @@ func (r *Repository) IncrementFreeOrders(ctx context.Context, tradeDate time.Tim
 INSERT INTO free_order_counters (trade_date, instrument_uid, orders_sent)
 VALUES (?, ?, ?)
 ON DUPLICATE KEY UPDATE orders_sent=orders_sent+VALUES(orders_sent)`, dateOnly(tradeDate), instrumentUID, delta)
+	return err
+}
+
+func (r *Repository) ReserveFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+	if delta <= 0 {
+		return nil
+	}
+	if limit <= 0 {
+		return r.IncrementFreeOrders(ctx, tradeDate, instrumentUID, delta)
+	}
+	return r.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
+		txRepo, ok := repo.(*Repository)
+		if !ok {
+			return errors.New("unexpected repository implementation")
+		}
+		return txRepo.reserveFreeOrdersLocked(ctx, tradeDate, instrumentUID, delta, limit)
+	})
+}
+
+func (r *Repository) reserveFreeOrdersLocked(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+	tradeDay := dateOnly(tradeDate)
+	if _, err := r.execer().ExecContext(ctx, `
+INSERT IGNORE INTO free_order_counters (trade_date, instrument_uid, orders_sent)
+VALUES (?, ?, 0)`, tradeDay, instrumentUID); err != nil {
+		return err
+	}
+	var sent int
+	if err := r.getContext(ctx, &sent, `
+SELECT orders_sent FROM free_order_counters
+WHERE trade_date=? AND instrument_uid=?
+FOR UPDATE`, tradeDay, instrumentUID); err != nil {
+		return err
+	}
+	remaining := limit - sent
+	if remaining < delta {
+		return fmt.Errorf("%w: %s remaining=%d needed=%d", risk.ErrFreeOrderBudget, instrumentUID, remaining, delta)
+	}
+	_, err := r.execer().ExecContext(ctx, `
+UPDATE free_order_counters
+SET orders_sent=orders_sent+?
+WHERE trade_date=? AND instrument_uid=?`, delta, tradeDay, instrumentUID)
 	return err
 }
 

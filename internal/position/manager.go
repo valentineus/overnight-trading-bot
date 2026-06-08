@@ -33,7 +33,7 @@ func (m Manager) OnEntryFill(ctx context.Context, accountIDHash string, instrume
 		Lot:             lot,
 		AvgBuyPrice:     order.AvgFillPrice,
 		CommissionTotal: order.Commission,
-		Status:          domain.PositionHoldingOvernight,
+		Status:          domain.PositionEntryFilled,
 		OpenedAt:        &now,
 		UpdatedAt:       now,
 	}

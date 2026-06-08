@@ -650,6 +650,49 @@ func TestPlaceExitUsesCurrentTradeDateForOrderAndFreeCounter(t *testing.T) {
 	}
 }
 
+func TestGracefulShutdownCancelsActiveOrders(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order := domain.Order{
+		ClientOrderID: "shutdown-order",
+		BrokerOrderID: "broker-shutdown-order",
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		TradeDate:     tradeDate,
+		Side:          domain.SideBuy,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    decimal.NewFromInt(100),
+		QuantityLots:  1,
+		Status:        domain.OrderStatusSent,
+		RawStateJSON:  "{}",
+	}
+	if err := repo.UpsertOrder(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Orders[order.BrokerOrderID] = order
+	execEngine := execution.NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	s := Scheduler{
+		cfg: Config{Mode: domain.ModeSandbox},
+		svc: Services{
+			Repo:          repo,
+			Execution:     &execEngine,
+			AccountIDHash: "hash",
+		},
+	}
+	if err := s.GracefulShutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := repo.ListOrders(ctx, "hash", tradeDate, tradeDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Status != domain.OrderStatusCancelled {
+		t.Fatalf("orders=%+v, want cancelled", orders)
+	}
+}
+
 func mustTOD(raw string) timeutil.TimeOfDay {
 	tod, err := timeutil.ParseTimeOfDay(raw)
 	if err != nil {
