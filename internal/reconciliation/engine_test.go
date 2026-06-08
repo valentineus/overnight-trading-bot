@@ -142,6 +142,20 @@ func TestReconciliationQuarantinesOnNonZeroBrokerCommission(t *testing.T) {
 	}
 }
 
+func TestCompareOperationsFlagsNonZeroCommissionWithoutInstrument(t *testing.T) {
+	diffs := compareOperationsWithPolicy(nil, []domain.Operation{{
+		Type:       "OPERATION_TYPE_BROKER_FEE",
+		Commission: decimal.NewFromFloat(0.01),
+		ExecutedAt: time.Now().UTC(),
+	}}, true, decimal.Zero)
+	for _, diff := range diffs {
+		if diff.Kind == "actual_commission_nonzero" && diff.Critical {
+			return
+		}
+	}
+	t.Fatalf("expected critical nonzero commission diff, got %+v", diffs)
+}
+
 func TestReconciliationSkipsFreshInFlightLocalOrders(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

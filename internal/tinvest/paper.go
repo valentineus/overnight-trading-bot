@@ -62,7 +62,18 @@ func (g *PaperGateway) CancelOrder(ctx context.Context, accountID, orderID strin
 }
 
 func (g *PaperGateway) GetOrderState(ctx context.Context, accountID, orderID string) (domain.Order, error) {
-	return g.Fake().GetOrderState(ctx, accountID, orderID)
+	order, err := g.Fake().GetOrderState(ctx, accountID, orderID)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	if !paperOrderCanFill(order) {
+		return order, nil
+	}
+	book, err := g.GetOrderBook(ctx, order.InstrumentUID, 20)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	return g.Fake().SimulateOrderBookFill(orderID, book)
 }
 
 func (g *PaperGateway) GetActiveOrders(ctx context.Context, accountID string) ([]domain.Order, error) {
@@ -82,4 +93,10 @@ func (g *PaperGateway) GetServerTime(ctx context.Context) (time.Time, error) {
 		return g.market.GetServerTime(ctx)
 	}
 	return g.Fake().GetServerTime(ctx)
+}
+
+func paperOrderCanFill(order domain.Order) bool {
+	return order.Status == domain.OrderStatusSent ||
+		order.Status == domain.OrderStatusPartiallyFilled ||
+		order.Status == domain.OrderStatusNew
 }

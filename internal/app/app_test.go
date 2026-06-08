@@ -36,6 +36,15 @@ func TestRunBacktestModeWithoutDB(t *testing.T) {
 	}
 }
 
+func TestHealthURLDefaultsToReadyEndpoint(t *testing.T) {
+	if got := HealthURL(":3300"); got != "http://127.0.0.1:3300/ready" {
+		t.Fatalf("HealthURL(:3300)=%s", got)
+	}
+	if got := HealthURL("127.0.0.1:3301"); got != "http://127.0.0.1:3301/ready" {
+		t.Fatalf("HealthURL(host)=%s", got)
+	}
+}
+
 func TestSeedPaperGatewayMakesSeedInstrumentsDiscoverable(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

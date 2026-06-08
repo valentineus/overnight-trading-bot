@@ -71,10 +71,100 @@ func ComposeDaily(input DailyInput) string {
 		averageSpread = averageContextDecimal(input.Signals, "spread_bps")
 	}
 	fmt.Fprintf(&b, "Средний spread: %s bps\n", averageSpread.StringFixed(2))
-	fmt.Fprintf(&b, "Среднее проскальзывание: %s bps\n", input.AverageSlipBps.StringFixed(2))
+	averageSlip := input.AverageSlipBps
+	if averageSlip.IsZero() {
+		averageSlip = AverageAdverseSlippageBps(input.Orders, 0)
+	}
+	fmt.Fprintf(&b, "Среднее проскальзывание: %s bps\n", averageSlip.StringFixed(2))
 	writeExecutionErrors(&b, input.Orders)
 	fmt.Fprintf(&b, "Risk: %s", input.RiskStatus)
 	return b.String()
+}
+
+func AverageAdverseSlippageBps(orders []domain.Order, limit int) decimal.Decimal {
+	if len(orders) == 0 {
+		return decimal.Zero
+	}
+	sorted := append([]domain.Order(nil), orders...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].UpdatedAt.After(sorted[j].UpdatedAt)
+	})
+	sum := decimal.Zero
+	weight := decimal.Zero
+	count := 0
+	for _, order := range sorted {
+		slippage, ok := orderAdverseSlippageBps(order)
+		if !ok {
+			continue
+		}
+		lots := decimal.NewFromInt(order.FilledLots)
+		sum = sum.Add(slippage.Mul(lots))
+		weight = weight.Add(lots)
+		count++
+		if limit > 0 && count == limit {
+			break
+		}
+	}
+	if weight.IsZero() {
+		return decimal.Zero
+	}
+	return sum.Div(weight)
+}
+
+func orderAdverseSlippageBps(order domain.Order) (decimal.Decimal, bool) {
+	if order.FilledLots <= 0 || !order.AvgFillPrice.IsPositive() {
+		return decimal.Zero, false
+	}
+	reference := orderReferencePrice(order)
+	if !reference.IsPositive() {
+		return decimal.Zero, false
+	}
+	var adverse decimal.Decimal
+	switch order.Side {
+	case domain.SideBuy:
+		adverse = order.AvgFillPrice.Sub(reference)
+	case domain.SideSell:
+		adverse = reference.Sub(order.AvgFillPrice)
+	default:
+		return decimal.Zero, false
+	}
+	if adverse.IsNegative() {
+		adverse = decimal.Zero
+	}
+	return adverse.Div(reference).Mul(decimal.NewFromInt(10_000)), true
+}
+
+func orderReferencePrice(order domain.Order) decimal.Decimal {
+	if mid := rawMidPrice(order.RawStateJSON); mid.IsPositive() {
+		return mid
+	}
+	return order.LimitPrice
+}
+
+func rawMidPrice(raw string) decimal.Decimal {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		return decimal.Zero
+	}
+	if mid := midFromContainer(root); mid.IsPositive() {
+		return mid
+	}
+	if local, ok := root["local"].(map[string]any); ok {
+		return midFromContainer(local)
+	}
+	return decimal.Zero
+}
+
+func midFromContainer(container map[string]any) decimal.Decimal {
+	quote, ok := container["local_quote"].(map[string]any)
+	if !ok {
+		return decimal.Zero
+	}
+	mid, ok := decimalFromAny(quote["mid"])
+	if !ok {
+		return decimal.Zero
+	}
+	return mid
 }
 
 func groupedReasons(signals []domain.Signal) map[string]int {

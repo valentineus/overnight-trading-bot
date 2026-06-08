@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -110,7 +111,7 @@ func (e *Engine) PlaceEntry(ctx context.Context, accountIDHash string, instrumen
 		QuantityLots:  lots,
 		Status:        domain.OrderStatusNew,
 		AttemptNo:     attempt,
-		RawStateJSON:  "{}",
+		RawStateJSON:  orderContextJSON(book),
 	}, instrument.FreeOrderLimitPerDay)
 }
 
@@ -137,7 +138,7 @@ func (e *Engine) PlaceExit(ctx context.Context, accountIDHash string, instrument
 		QuantityLots:  lots,
 		Status:        domain.OrderStatusNew,
 		AttemptNo:     attempt,
-		RawStateJSON:  "{}",
+		RawStateJSON:  orderContextJSON(book),
 	}, instrument.FreeOrderLimitPerDay)
 }
 
@@ -152,6 +153,9 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 	if e.mode != domain.ModePaper && !e.mode.AllowsBrokerOrders() {
 		return order, ErrBrokerOrdersDisabled
 	}
+	if e.gateway == nil {
+		return domain.Order{}, errors.New("gateway is nil")
+	}
 	if e.store != nil {
 		existing, err := e.findExisting(ctx, order)
 		if err != nil {
@@ -160,12 +164,6 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 		if existing.ClientOrderID != "" {
 			return existing, nil
 		}
-	}
-	if e.mode == domain.ModePaper {
-		return e.placePaperLimit(ctx, order, freeOrderLimit)
-	}
-	if e.gateway == nil {
-		return domain.Order{}, errors.New("gateway is nil")
 	}
 
 	now := e.nowUTC()
@@ -203,6 +201,7 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 	posted.QuantityLots = order.QuantityLots
 	posted.AttemptNo = order.AttemptNo
 	posted.TradeDate = order.TradeDate
+	posted.RawStateJSON = mergeRawStateJSON(order.RawStateJSON, posted.RawStateJSON)
 	posted.CreatedAt = now
 	posted.UpdatedAt = posted.CreatedAt
 	if e.store != nil {
@@ -211,28 +210,6 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 		}
 	}
 	return posted, nil
-}
-
-func (e *Engine) placePaperLimit(ctx context.Context, order domain.Order, freeOrderLimit int) (domain.Order, error) {
-	now := e.nowUTC()
-	order.BrokerOrderID = "paper-" + order.ClientOrderID
-	order.FilledLots = order.QuantityLots
-	order.AvgFillPrice = order.LimitPrice
-	order.Status = domain.OrderStatusFilled
-	order.RawStateJSON = `{"paper_fill":true}`
-	order.CreatedAt = now
-	order.UpdatedAt = now
-	if e.store != nil {
-		if err := e.store.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
-			if err := repo.UpsertOrder(ctx, order); err != nil {
-				return fmt.Errorf("persist paper order: %w", err)
-			}
-			return repo.ReserveFreeOrders(ctx, order.TradeDate, order.InstrumentUID, 1, freeOrderLimit)
-		}); err != nil {
-			return domain.Order{}, err
-		}
-	}
-	return order, nil
 }
 
 func (e *Engine) findExisting(ctx context.Context, order domain.Order) (domain.Order, error) {
@@ -268,6 +245,7 @@ func (e *Engine) Refresh(ctx context.Context, order domain.Order) (domain.Order,
 	state.LimitPrice = order.LimitPrice
 	state.QuantityLots = order.QuantityLots
 	state.AttemptNo = order.AttemptNo
+	state.RawStateJSON = mergeRawStateJSON(localRawStateJSON(order.RawStateJSON), state.RawStateJSON)
 	if e.store != nil {
 		if err := e.store.UpsertOrder(ctx, state); err != nil {
 			return domain.Order{}, err
@@ -581,6 +559,73 @@ func quoteTimestamp(book domain.OrderBook) time.Time {
 		return book.Time.UTC()
 	}
 	return book.ReceivedAt.UTC()
+}
+
+func orderContextJSON(book domain.OrderBook) string {
+	bid, ask, err := bestBidAsk(book)
+	if err != nil {
+		return "{}"
+	}
+	mid := bid.Add(ask).Div(decimal.NewFromInt(2))
+	context := map[string]any{
+		"local_quote": map[string]string{
+			"best_bid": bid.String(),
+			"best_ask": ask.String(),
+			"mid":      mid.String(),
+		},
+	}
+	if ts := quoteTimestamp(book); !ts.IsZero() {
+		context["local_quote"].(map[string]string)["quote_ts"] = ts.UTC().Format(time.RFC3339Nano)
+	}
+	raw, err := json.Marshal(context)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func mergeRawStateJSON(localRaw, brokerRaw string) string {
+	local := decodeRawJSON(localRaw)
+	broker := decodeRawJSON(brokerRaw)
+	raw, err := json.Marshal(map[string]any{
+		"local":  local,
+		"broker": broker,
+	})
+	if err != nil {
+		return brokerRaw
+	}
+	return string(raw)
+}
+
+func decodeRawJSON(raw string) any {
+	if raw == "" {
+		return map[string]any{}
+	}
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return raw
+	}
+	return value
+}
+
+func localRawStateJSON(raw string) string {
+	var object map[string]any
+	if err := json.Unmarshal([]byte(raw), &object); err != nil {
+		return raw
+	}
+	if local, ok := object["local"]; ok {
+		encoded, err := json.Marshal(local)
+		if err == nil {
+			return string(encoded)
+		}
+	}
+	if quote, ok := object["local_quote"]; ok {
+		encoded, err := json.Marshal(map[string]any{"local_quote": quote})
+		if err == nil {
+			return string(encoded)
+		}
+	}
+	return raw
 }
 
 func (e *Engine) lockFor(instrumentUID string) *sync.Mutex {

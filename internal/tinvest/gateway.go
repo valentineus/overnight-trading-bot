@@ -3,6 +3,7 @@ package tinvest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -28,24 +29,28 @@ type Gateway interface {
 }
 
 type FakeGateway struct {
-	mu          sync.Mutex
-	Instruments map[string]domain.Instrument
-	Candles     map[string][]domain.Candle
-	OrderBooks  map[string]domain.OrderBook
-	Statuses    map[string]domain.TradingStatus
-	Orders      map[string]domain.Order
-	Portfolio   domain.Portfolio
-	Operations  []domain.Operation
-	ServerTime  time.Time
+	mu               sync.Mutex
+	Instruments      map[string]domain.Instrument
+	InstrumentErrors map[string]error
+	Candles          map[string][]domain.Candle
+	CandleErrors     map[string]error
+	OrderBooks       map[string]domain.OrderBook
+	Statuses         map[string]domain.TradingStatus
+	Orders           map[string]domain.Order
+	Portfolio        domain.Portfolio
+	Operations       []domain.Operation
+	ServerTime       time.Time
 }
 
 func NewFakeGateway() *FakeGateway {
 	return &FakeGateway{
-		Instruments: make(map[string]domain.Instrument),
-		Candles:     make(map[string][]domain.Candle),
-		OrderBooks:  make(map[string]domain.OrderBook),
-		Statuses:    make(map[string]domain.TradingStatus),
-		Orders:      make(map[string]domain.Order),
+		Instruments:      make(map[string]domain.Instrument),
+		InstrumentErrors: make(map[string]error),
+		Candles:          make(map[string][]domain.Candle),
+		CandleErrors:     make(map[string]error),
+		OrderBooks:       make(map[string]domain.OrderBook),
+		Statuses:         make(map[string]domain.TradingStatus),
+		Orders:           make(map[string]domain.Order),
 		Portfolio: domain.Portfolio{
 			Equity:    decimal.NewFromInt(100_000),
 			Cash:      decimal.NewFromInt(100_000),
@@ -59,6 +64,9 @@ func (f *FakeGateway) GetInstrument(_ context.Context, ticker, classCode string)
 	defer f.mu.Unlock()
 	for _, instrument := range f.Instruments {
 		if instrument.Ticker == ticker && instrument.ClassCode == classCode {
+			if err := f.InstrumentErrors[instrument.InstrumentUID]; err != nil {
+				return domain.Instrument{}, err
+			}
 			return instrument, nil
 		}
 	}
@@ -68,6 +76,9 @@ func (f *FakeGateway) GetInstrument(_ context.Context, ticker, classCode string)
 func (f *FakeGateway) GetCandles(_ context.Context, instrumentUID string, _ string, from, to time.Time) ([]domain.Candle, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.CandleErrors[instrumentUID]; err != nil {
+		return nil, err
+	}
 	var out []domain.Candle
 	for _, candle := range f.Candles[instrumentUID] {
 		if !candle.TradeDate.Before(from) && !candle.TradeDate.After(to) {
@@ -141,6 +152,40 @@ func (f *FakeGateway) GetOrderState(_ context.Context, _ string, orderID string)
 	return order, nil
 }
 
+func (f *FakeGateway) SimulateOrderBookFill(orderID string, book domain.OrderBook) (domain.Order, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	order, ok := f.Orders[orderID]
+	if !ok {
+		return domain.Order{}, ErrNotFound
+	}
+	if isTerminalFakeOrder(order.Status) || order.FilledLots >= order.QuantityLots {
+		return order, nil
+	}
+	price, availableLots, ok := paperFillLevel(order, book)
+	if !ok || availableLots <= 0 {
+		return order, nil
+	}
+	remaining := order.QuantityLots - order.FilledLots
+	fillLots := minInt64(remaining, availableLots)
+	if fillLots <= 0 {
+		return order, nil
+	}
+	order.AvgFillPrice = paperWeightedAvg(order.AvgFillPrice, order.FilledLots, price, fillLots)
+	order.FilledLots += fillLots
+	if order.FilledLots >= order.QuantityLots {
+		order.Status = domain.OrderStatusFilled
+	} else {
+		order.Status = domain.OrderStatusPartiallyFilled
+	}
+	now := time.Now().UTC()
+	order.UpdatedAt = now
+	order.RawStateJSON = fmt.Sprintf(`{"paper_fill":true,"filled_lots":%d}`, order.FilledLots)
+	f.Orders[orderID] = order
+	f.recordPaperOperationLocked(order, fillLots, price, now)
+	return order, nil
+}
+
 func (f *FakeGateway) GetActiveOrders(_ context.Context, _ string) ([]domain.Order, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -179,4 +224,71 @@ func (f *FakeGateway) GetServerTime(context.Context) (time.Time, error) {
 		return time.Now().UTC(), nil
 	}
 	return f.ServerTime, nil
+}
+
+func isTerminalFakeOrder(status domain.OrderStatus) bool {
+	return status == domain.OrderStatusFilled ||
+		status == domain.OrderStatusCancelled ||
+		status == domain.OrderStatusRejected ||
+		status == domain.OrderStatusExpired ||
+		status == domain.OrderStatusFailed
+}
+
+func paperFillLevel(order domain.Order, book domain.OrderBook) (decimal.Decimal, int64, bool) {
+	switch order.Side {
+	case domain.SideBuy:
+		if len(book.Asks) == 0 {
+			return decimal.Zero, 0, false
+		}
+		ask := book.Asks[0]
+		if ask.Price.IsPositive() && order.LimitPrice.GreaterThanOrEqual(ask.Price) {
+			return ask.Price, ask.QuantityLots, true
+		}
+	case domain.SideSell:
+		if len(book.Bids) == 0 {
+			return decimal.Zero, 0, false
+		}
+		bid := book.Bids[0]
+		if bid.Price.IsPositive() && order.LimitPrice.LessThanOrEqual(bid.Price) {
+			return bid.Price, bid.QuantityLots, true
+		}
+	}
+	return decimal.Zero, 0, false
+}
+
+func paperWeightedAvg(currentAvg decimal.Decimal, currentLots int64, fillPrice decimal.Decimal, fillLots int64) decimal.Decimal {
+	if currentLots <= 0 {
+		return fillPrice
+	}
+	totalLots := currentLots + fillLots
+	if totalLots <= 0 {
+		return decimal.Zero
+	}
+	return currentAvg.Mul(decimal.NewFromInt(currentLots)).
+		Add(fillPrice.Mul(decimal.NewFromInt(fillLots))).
+		Div(decimal.NewFromInt(totalLots))
+}
+
+func (f *FakeGateway) recordPaperOperationLocked(order domain.Order, fillLots int64, price decimal.Decimal, ts time.Time) {
+	payment := price.Mul(decimal.NewFromInt(fillLots))
+	opType := "OPERATION_TYPE_SELL"
+	if order.Side == domain.SideBuy {
+		payment = payment.Neg()
+		opType = "OPERATION_TYPE_BUY"
+	}
+	f.Operations = append(f.Operations, domain.Operation{
+		ID:            fmt.Sprintf("%s-%d", order.BrokerOrderID, len(f.Operations)+1),
+		InstrumentUID: order.InstrumentUID,
+		Type:          opType,
+		Payment:       payment,
+		Commission:    decimal.Zero,
+		ExecutedAt:    ts,
+	})
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }

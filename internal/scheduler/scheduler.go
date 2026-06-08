@@ -868,12 +868,13 @@ func (s *Scheduler) sendDailyReport(ctx context.Context, now time.Time, riskStat
 		}
 	}
 	msg := report.ComposeDaily(report.DailyInput{
-		Date:       tradeDate,
-		Mode:       s.cfg.Mode,
-		Signals:    signals,
-		Positions:  positionsList,
-		Orders:     orders,
-		RiskStatus: riskStatus,
+		Date:           tradeDate,
+		Mode:           s.cfg.Mode,
+		Signals:        signals,
+		Positions:      positionsList,
+		Orders:         orders,
+		AverageSlipBps: report.AverageAdverseSlippageBps(orders, 0),
+		RiskStatus:     riskStatus,
 	})
 	if err := s.svc.Notifier.Report(ctx, msg); err != nil {
 		return err
@@ -1328,7 +1329,6 @@ func (s Scheduler) riskMetrics(ctx context.Context, now time.Time, portfolio dom
 	weekStart := today.AddDate(0, 0, -6)
 	var metrics preTradeMetrics
 	monthlyPnL := decimal.Zero
-	var closed []domain.Position
 	for _, pos := range positionsList {
 		if pos.Status != domain.PositionExitFilled {
 			continue
@@ -1347,62 +1347,16 @@ func (s Scheduler) riskMetrics(ctx context.Context, now time.Time, portfolio dom
 		if !closeDate.Before(monthStart) {
 			monthlyPnL = monthlyPnL.Add(pos.NetPnL)
 		}
-		closed = append(closed, pos)
 	}
 	if monthlyPnL.IsNegative() && portfolio.Equity.IsPositive() {
 		metrics.monthlyDrawdownPct = monthlyPnL.Neg().Div(portfolio.Equity)
 	}
-	avg, err := s.averageAdverseSlippageBps(ctx, closed, 10)
+	orders, err := s.svc.Repo.ListOrders(ctx, s.svc.AccountIDHash, monthStart.AddDate(0, 0, -7), today)
 	if err != nil {
 		return preTradeMetrics{}, err
 	}
-	metrics.avgSlippageBps10 = avg
+	metrics.avgSlippageBps10 = report.AverageAdverseSlippageBps(orders, 10)
 	return metrics, nil
-}
-
-func (s Scheduler) averageAdverseSlippageBps(ctx context.Context, positionsList []domain.Position, limit int) (decimal.Decimal, error) {
-	if limit <= 0 {
-		return decimal.Zero, nil
-	}
-	sort.Slice(positionsList, func(i, j int) bool {
-		return positionCloseTime(positionsList[i]).After(positionCloseTime(positionsList[j]))
-	})
-	signalsByDate := make(map[string][]domain.Signal)
-	var values []decimal.Decimal
-	for _, pos := range positionsList {
-		key := tradingDate(pos.OpenTradeDate).Format("2006-01-02")
-		signals, ok := signalsByDate[key]
-		if !ok {
-			var err error
-			signals, err = s.svc.Repo.ListSignals(ctx, tradingDate(pos.OpenTradeDate))
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return decimal.Zero, err
-			}
-			signalsByDate[key] = signals
-		}
-		for _, sig := range signals {
-			if sig.InstrumentUID != pos.InstrumentUID || sig.Decision != domain.DecisionEnter {
-				continue
-			}
-			adverse := sig.NetEdgeBps.Sub(pos.RealizedEdgeBps)
-			if adverse.IsNegative() {
-				adverse = decimal.Zero
-			}
-			values = append(values, adverse)
-			break
-		}
-		if len(values) == limit {
-			break
-		}
-	}
-	if len(values) == 0 {
-		return decimal.Zero, nil
-	}
-	sum := decimal.Zero
-	for _, value := range values {
-		sum = sum.Add(value)
-	}
-	return sum.Div(decimal.NewFromInt(int64(len(values)))), nil
 }
 
 func positionCloseTime(pos domain.Position) time.Time {

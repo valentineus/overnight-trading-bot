@@ -58,7 +58,7 @@ func Run(ctx context.Context, opts Options) error {
 	if opts.Healthcheck {
 		target := opts.HealthcheckURL
 		if target == "" {
-			target = "http://127.0.0.1:3300/health"
+			target = "http://127.0.0.1:3300/ready"
 		}
 		return healthcheck.CheckEndpoint(ctx, target)
 	}
@@ -465,12 +465,12 @@ func accountHash(accountID string) string {
 
 func HealthURL(addr string) string {
 	if strings.HasPrefix(addr, ":") {
-		return "http://127.0.0.1" + addr + "/health"
+		return "http://127.0.0.1" + addr + "/ready"
 	}
 	if _, err := url.ParseRequestURI(addr); err == nil && strings.HasPrefix(addr, "http") {
 		return addr
 	}
-	return "http://" + addr + "/health"
+	return "http://" + addr + "/ready"
 }
 
 func PingDB(ctx context.Context, db *sql.DB) error {

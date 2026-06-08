@@ -447,7 +447,11 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 		return candidate{}, false, nil
 	}
 	lot := e.lotFor(instrumentUID)
-	history := candles[:exitIndex]
+	entryIndex := exitIndex - 1
+	if entryIndex <= 0 {
+		return candidate{}, false, nil
+	}
+	history := candles[:entryIndex]
 	returns := make([]float64, 0, len(history)-1)
 	for j := 1; j < len(history); j++ {
 		r, err := features.OvernightReturn(history[j].Open, history[j-1].Close)
@@ -490,7 +494,7 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 	case adv.LessThan(e.cfg.MinADVRUB):
 		return candidate{}, false, nil
 	}
-	entry := candles[exitIndex-1]
+	entry := candles[entryIndex]
 	exit := candles[exitIndex]
 	buy := entry.Close.Mul(decimal.NewFromInt(1).Add(money.FromBps(e.cfg.EntrySlippageBps)))
 	sell := exit.Open.Mul(decimal.NewFromInt(1).Sub(money.FromBps(e.cfg.ExitSlippageBps)))

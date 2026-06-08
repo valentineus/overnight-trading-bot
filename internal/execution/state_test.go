@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,6 +111,35 @@ func TestPlaceEntryReservesFreeOrderBudgetAtomically(t *testing.T) {
 	}
 }
 
+func TestRefreshPreservesLocalQuoteContext(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:     "uid",
+		Lot:               1,
+		MinPriceIncrement: decimal.NewFromInt(1),
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	order, err := engine.PlaceEntry(ctx, "hash", instrument, time.Now().UTC(), 1, book, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := engine.Refresh(ctx, order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(refreshed.RawStateJSON, "local_quote") || !strings.Contains(refreshed.RawStateJSON, `"mid":"100"`) {
+		t.Fatalf("raw state lost local quote context: %s", refreshed.RawStateJSON)
+	}
+}
+
 func TestMonitorOnceUsesInjectedClockForDeadline(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -160,10 +190,17 @@ func TestMonitorOnceUsesInjectedClockForDeadline(t *testing.T) {
 	}
 }
 
-func TestPaperPlaceEntryFillsAndCountsSubmittedOrder(t *testing.T) {
+func TestPaperPlaceEntryFillsOnlyWhenOrderBookCrosses(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
-	engine := NewEngine(domain.ModePaper, "account", tinvest.NewFakeGateway(), repo)
+	paper := tinvest.NewPaperGateway(nil)
+	paper.Fake().OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	engine := NewEngine(domain.ModePaper, "account", paper, repo)
 	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
 	order, err := engine.PlaceEntry(ctx, "hash", domain.Instrument{
 		InstrumentUID:     "uid",
@@ -178,8 +215,34 @@ func TestPaperPlaceEntryFillsAndCountsSubmittedOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if order.Status != domain.OrderStatusFilled || order.FilledLots != 2 || order.BrokerOrderID == "" {
-		t.Fatalf("paper order=%+v, want filled broker-like order", order)
+	if order.Status != domain.OrderStatusSent || order.FilledLots != 0 || order.BrokerOrderID == "" {
+		t.Fatalf("paper order=%+v, want sent unfilled broker-like order", order)
+	}
+	paper.Fake().OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(100), QuantityLots: 1}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	partial, err := engine.MonitorOnce(ctx, order, MonitorConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.Status != domain.OrderStatusPartiallyFilled || partial.FilledLots != 1 {
+		t.Fatalf("paper partial order=%+v, want 1 lot partial fill", partial)
+	}
+	paper.Fake().OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(100), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	filled, err := engine.MonitorOnce(ctx, partial, MonitorConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled.Status != domain.OrderStatusFilled || filled.FilledLots != 2 {
+		t.Fatalf("paper filled order=%+v, want full fill", filled)
 	}
 	sent, err := repo.GetFreeOrdersSent(ctx, tradeDate, "uid")
 	if err != nil {

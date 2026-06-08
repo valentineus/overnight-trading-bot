@@ -32,7 +32,7 @@ APP_MODE=backtest go run ./cmd/bot
 | `APP_MODE` | `backtest`, `paper`, `sandbox`, `live_readonly`, `live_trade` | нет, в `.env.example`: `paper` | обязательна; только перечисленные значения | Режим работы. `backtest` не требует БД и API в `cmd/bot`; `paper` без `TINVEST_TOKEN` использует fake gateway, а с токеном берёт реальные market data/status через T-Invest при симулированных заявках; `sandbox`, `live_readonly`, `live_trade` подключаются к T-Invest API; `live_trade` может отправлять брокерские заявки. |
 | `APP_TIMEZONE` | `Europe/Moscow` | `Europe/Moscow` | жёстко только `Europe/Moscow` | Таймзона расписания торговых окон. Изменить нельзя без изменения валидации. |
 | `APP_LOG_LEVEL` | `debug`, `info`, `warn`, `warning`, `error` | `info` | неизвестное значение трактуется как `info` | Уровень JSON-логов. Ниже уровень - больше диагностических записей. |
-| `APP_HEALTHCHECK_ADDR` | HTTP listen address, например `:3300` или `127.0.0.1:3300` | `:3300` | без отдельной валидации | Адрес `/health` и `/ready`. При изменении меняется порт или интерфейс healthcheck-сервера. |
+| `APP_HEALTHCHECK_ADDR` | HTTP listen address, например `:3300` или `127.0.0.1:3300` | `:3300` | без отдельной валидации | Адрес `/health` и `/ready`; CLI `-healthcheck` по умолчанию проверяет `/ready`. При изменении меняется порт или интерфейс healthcheck-сервера. |
 | `APP_SHUTDOWN_TIMEOUT_SEC` | целое число секунд | `30` | должно быть `> 0` | Таймаут graceful shutdown для HTTP healthcheck при остановке. |
 
 ### TINVEST

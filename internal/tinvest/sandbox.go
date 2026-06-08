@@ -135,7 +135,9 @@ func (g *SandboxGateway) GetPortfolio(ctx context.Context, accountID string) (do
 	if err != nil {
 		return domain.Portfolio{}, err
 	}
-	return portfolioFromResponse(resp, g.lotForInstrument)
+	return portfolioFromResponse(resp, func(instrumentUID string) (int64, error) {
+		return g.resolveInstrumentLot(ctx, instrumentUID)
+	})
 }
 
 func (g *SandboxGateway) GetOperations(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {

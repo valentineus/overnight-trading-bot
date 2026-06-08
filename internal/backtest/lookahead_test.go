@@ -86,7 +86,7 @@ func TestEvaluateCandidateUsesInstrumentLotAndTick(t *testing.T) {
 		ExitSlippageBps:                decimal.NewFromInt(13),
 	})
 	candles := candidateCandles("uid")
-	got, ok, err := engine.evaluateCandidate("uid", candles, 3)
+	got, ok, err := engine.evaluateCandidate("uid", candles, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +149,31 @@ func TestBacktestWithoutMinuteDataDoesNotReportADVAsCapacity(t *testing.T) {
 	}
 }
 
+func TestEvaluateCandidateIgnoresEntryDayOpenForSignal(t *testing.T) {
+	engine := New(Config{
+		RollingShort:  2,
+		RollingLong:   2,
+		MinTStat60:    decimal.NewFromInt(-1),
+		MinWinRate60:  decimal.NewFromFloat(0.1),
+		MinNetEdgeBps: decimal.NewFromInt(-1000),
+		MinADVRUB:     decimal.NewFromInt(1),
+		Lot:           1,
+	})
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	candles := []domain.Candle{
+		{InstrumentUID: "uid", TradeDate: start, Open: decimal.NewFromInt(100), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+		{InstrumentUID: "uid", TradeDate: start.AddDate(0, 0, 1), Open: decimal.NewFromInt(101), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+		{InstrumentUID: "uid", TradeDate: start.AddDate(0, 0, 2), Open: decimal.NewFromInt(102), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+		{InstrumentUID: "uid", TradeDate: start.AddDate(0, 0, 3), Open: decimal.NewFromInt(1), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+		{InstrumentUID: "uid", TradeDate: start.AddDate(0, 0, 4), Open: decimal.NewFromInt(105), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+	}
+	if _, ok, err := engine.evaluateCandidate("uid", candles, 4); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("entry-day open leaked into signal and rejected the candidate")
+	}
+}
+
 func TestLoadCandlesCSVWithMetadata(t *testing.T) {
 	raw := strings.NewReader(`instrument_uid,trade_date,open,high,low,close,volume_lots,lot,min_price_increment
 uid,2024-01-02,100,101,99,100,10,10,0.05
@@ -172,5 +197,6 @@ func candidateCandles(uid string) []domain.Candle {
 		{InstrumentUID: uid, TradeDate: start.AddDate(0, 0, 1), Open: decimal.NewFromInt(101), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
 		{InstrumentUID: uid, TradeDate: start.AddDate(0, 0, 2), Open: decimal.NewFromInt(102), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
 		{InstrumentUID: uid, TradeDate: start.AddDate(0, 0, 3), Open: decimal.NewFromInt(105), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
+		{InstrumentUID: uid, TradeDate: start.AddDate(0, 0, 4), Open: decimal.NewFromInt(105), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(10)},
 	}
 }

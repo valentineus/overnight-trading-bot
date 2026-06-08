@@ -306,12 +306,18 @@ func (g *RealGateway) GetPortfolio(ctx context.Context, accountID string) (domai
 	if err != nil {
 		return domain.Portfolio{}, err
 	}
-	return portfolioFromResponse(resp, g.lotForInstrument)
+	return portfolioFromResponse(resp, func(instrumentUID string) (int64, error) {
+		return g.resolveInstrumentLot(ctx, instrumentUID)
+	})
 }
 
 func (g *RealGateway) GetOperations(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	ops, err := g.getOperationsByCursor(ctx, accountID, from, to)
+	if err == nil {
+		return ops, nil
 	}
 	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.OperationsResponse, error) {
 		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.OperationsResponse, error) {
@@ -328,30 +334,122 @@ func (g *RealGateway) GetOperations(ctx context.Context, accountID string, from,
 	return operationsFromResponse(resp), nil
 }
 
+func (g *RealGateway) getOperationsByCursor(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {
+	limit := int32(1000)
+	withoutCommissions := false
+	withoutTrades := true
+	withoutOvernights := false
+	state := pb.OperationState_OPERATION_STATE_EXECUTED
+	var cursor *string
+	var out []domain.Operation
+	for {
+		resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.GetOperationsByCursorResponse, error) {
+			return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.GetOperationsByCursorResponse, error) {
+				return g.operationsPB.GetOperationsByCursor(callCtx, &pb.GetOperationsByCursorRequest{
+					AccountId:          accountID,
+					From:               investgo.TimeToTimestamp(from),
+					To:                 investgo.TimeToTimestamp(to),
+					Cursor:             cursor,
+					Limit:              &limit,
+					State:              &state,
+					WithoutCommissions: &withoutCommissions,
+					WithoutTrades:      &withoutTrades,
+					WithoutOvernights:  &withoutOvernights,
+				})
+			})
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, operationsFromCursorResponse(resp)...)
+		if !resp.GetHasNext() || resp.GetNextCursor() == "" {
+			return out, nil
+		}
+		next := resp.GetNextCursor()
+		cursor = &next
+	}
+}
+
 func operationsFromResponse(resp *pb.OperationsResponse) []domain.Operation {
 	ops := resp.GetOperations()
 	out := make([]domain.Operation, 0, len(ops))
 	for _, op := range ops {
 		payment := money.MoneyValueToDecimal(op.GetPayment())
+		instrumentUID := op.GetInstrumentUid()
+		commission := operationCommission(op.GetOperationType(), payment)
+		childCommission := decimal.Zero
+		for _, child := range op.GetChildOperations() {
+			childPayment := money.MoneyValueToDecimal(child.GetPayment())
+			if instrumentUID == "" {
+				instrumentUID = child.GetInstrumentUid()
+			}
+			childCommission = childCommission.Add(operationCommission(op.GetOperationType(), childPayment))
+		}
+		if commission.IsZero() {
+			commission = childCommission
+		}
 		out = append(out, domain.Operation{
 			ID:            op.GetId(),
-			InstrumentUID: op.GetInstrumentUid(),
+			InstrumentUID: instrumentUID,
 			Type:          op.GetOperationType().String(),
 			Payment:       payment,
-			Commission:    operationCommission(op.GetOperationType(), payment),
+			Commission:    commission,
 			ExecutedAt:    op.GetDate().AsTime().UTC(),
 		})
 	}
 	return out
 }
 
-func portfolioFromResponse(resp *pb.PortfolioResponse, lotForInstrument func(string) int64) (domain.Portfolio, error) {
+func operationsFromCursorResponse(resp *pb.GetOperationsByCursorResponse) []domain.Operation {
+	items := resp.GetItems()
+	out := make([]domain.Operation, 0, len(items))
+	for _, item := range items {
+		payment := money.MoneyValueToDecimal(item.GetPayment())
+		commission := money.Abs(money.MoneyValueToDecimal(item.GetCommission()))
+		instrumentUID := item.GetInstrumentUid()
+		childCommission := decimal.Zero
+		for _, child := range item.GetChildOperations() {
+			childPayment := money.Abs(money.MoneyValueToDecimal(child.GetPayment()))
+			if instrumentUID == "" {
+				instrumentUID = child.GetInstrumentUid()
+			}
+			if operationLooksLikeCommission(item.GetType(), childPayment) {
+				childCommission = childCommission.Add(childPayment)
+			}
+		}
+		if commission.IsZero() && operationLooksLikeCommission(item.GetType(), payment) {
+			commission = money.Abs(payment)
+		}
+		if commission.IsZero() {
+			commission = childCommission
+		}
+		out = append(out, domain.Operation{
+			ID:            item.GetId(),
+			InstrumentUID: instrumentUID,
+			Type:          item.GetType().String(),
+			Payment:       payment,
+			Commission:    commission,
+			ExecutedAt:    item.GetDate().AsTime().UTC(),
+		})
+	}
+	return out
+}
+
+func portfolioFromResponse(resp *pb.PortfolioResponse, lotForInstrument func(string) (int64, error)) (domain.Portfolio, error) {
 	positions := resp.GetPositions()
 	holdings := make([]domain.Holding, 0, len(positions))
 	for _, position := range positions {
+		if portfolioPositionIgnored(position) {
+			continue
+		}
+		lot, lotErr := portfolioPositionLot(position, lotForInstrument)
+		lots, err := portfolioQuantityLots(position, lot, lotErr)
+		if err != nil {
+			return domain.Portfolio{}, err
+		}
 		holdings = append(holdings, domain.Holding{
 			InstrumentUID: position.GetInstrumentUid(),
-			QuantityLots:  portfolioQuantityLots(position, portfolioPositionLot(position, lotForInstrument)),
+			QuantityLots:  lots,
 			AveragePrice:  money.MoneyValueToDecimal(position.GetAveragePositionPrice()),
 			MarketValue:   money.MoneyValueToDecimal(position.GetCurrentPrice()).Mul(money.QuotationToDecimal(position.GetQuantity())),
 		})
@@ -396,12 +494,20 @@ func (g *RealGateway) GetServerTime(ctx context.Context) (time.Time, error) {
 }
 
 func operationCommission(operationType pb.OperationType, payment decimal.Decimal) decimal.Decimal {
-	if operationType != pb.OperationType_OPERATION_TYPE_BROKER_FEE &&
-		operationType != pb.OperationType_OPERATION_TYPE_SERVICE_FEE &&
-		operationType != pb.OperationType_OPERATION_TYPE_SUCCESS_FEE {
+	if !operationTypeIsCommission(operationType) {
 		return decimal.Zero
 	}
 	return money.Abs(payment)
+}
+
+func operationTypeIsCommission(operationType pb.OperationType) bool {
+	return operationType == pb.OperationType_OPERATION_TYPE_BROKER_FEE ||
+		operationType == pb.OperationType_OPERATION_TYPE_SERVICE_FEE ||
+		operationType == pb.OperationType_OPERATION_TYPE_SUCCESS_FEE
+}
+
+func operationLooksLikeCommission(operationType pb.OperationType, payment decimal.Decimal) bool {
+	return operationTypeIsCommission(operationType) && !payment.IsZero()
 }
 
 func rubMoneyValueToDecimal(value *pb.MoneyValue) (decimal.Decimal, error) {
@@ -414,25 +520,38 @@ func rubMoneyValueToDecimal(value *pb.MoneyValue) (decimal.Decimal, error) {
 	return money.MoneyValueToDecimal(value), nil
 }
 
-func portfolioPositionLot(position *pb.PortfolioPosition, lotForInstrument func(string) int64) int64 {
+func portfolioPositionLot(position *pb.PortfolioPosition, lotForInstrument func(string) (int64, error)) (int64, error) {
 	if position == nil || lotForInstrument == nil {
-		return 0
+		return 0, nil
 	}
 	return lotForInstrument(position.GetInstrumentUid())
 }
 
-func portfolioQuantityLots(position *pb.PortfolioPosition, lot int64) int64 {
+func portfolioPositionIgnored(position *pb.PortfolioPosition) bool {
 	if position == nil {
-		return 0
+		return true
+	}
+	if money.QuotationToDecimal(position.GetQuantity()).IsZero() {
+		return true
+	}
+	return strings.EqualFold(position.GetInstrumentType(), "currency")
+}
+
+func portfolioQuantityLots(position *pb.PortfolioPosition, lot int64, lotErr error) (int64, error) {
+	if position == nil {
+		return 0, nil
 	}
 	if lots, ok := portfolioDeprecatedQuantityLots(position); ok {
-		return lots.IntPart()
+		return lots.IntPart(), nil
+	}
+	if lotErr != nil {
+		return 0, lotErr
 	}
 	quantity := money.QuotationToDecimal(position.GetQuantity())
 	if lot > 0 {
-		return quantity.Div(decimal.NewFromInt(lot)).IntPart()
+		return quantity.Div(decimal.NewFromInt(lot)).IntPart(), nil
 	}
-	return quantity.IntPart()
+	return 0, fmt.Errorf("portfolio lot size is unknown for %s", position.GetInstrumentUid())
 }
 
 func (g *RealGateway) storeInstrumentLot(instrument domain.Instrument) {
@@ -455,6 +574,33 @@ func (g *RealGateway) lotForInstrument(instrumentUID string) int64 {
 		return 0
 	}
 	return lot
+}
+
+func (g *RealGateway) resolveInstrumentLot(ctx context.Context, instrumentUID string) (int64, error) {
+	if lot := g.lotForInstrument(instrumentUID); lot > 0 {
+		return lot, nil
+	}
+	if instrumentUID == "" {
+		return 0, errors.New("portfolio instrument uid is empty")
+	}
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.InstrumentResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.InstrumentResponse, error) {
+			return g.instrumentsPB.GetInstrumentBy(callCtx, &pb.InstrumentRequest{
+				IdType: pb.InstrumentIdType_INSTRUMENT_ID_TYPE_UID,
+				Id:     instrumentUID,
+			})
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+	instrument := resp.GetInstrument()
+	if instrument == nil || instrument.GetLot() <= 0 {
+		return 0, fmt.Errorf("portfolio lot size is unavailable for %s", instrumentUID)
+	}
+	lot := int64(instrument.GetLot())
+	g.instrumentLots.Store(instrumentUID, lot)
+	return lot, nil
 }
 
 func portfolioDeprecatedQuantityLots(position *pb.PortfolioPosition) (decimal.Decimal, bool) {

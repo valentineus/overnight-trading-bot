@@ -14,8 +14,8 @@ func main() {
 	halt := flag.Bool("halt", false, "manually set HALT and stop new automated actions")
 	unhalt := flag.Bool("unhalt", false, "manually clear HALT after reconciliation")
 	reason := flag.String("reason", "", "audit reason for -halt or -unhalt")
-	health := flag.Bool("healthcheck", false, "check local /health endpoint")
-	healthURL := flag.String("healthcheck-url", "", "healthcheck URL; default http://127.0.0.1:3300/health")
+	health := flag.Bool("healthcheck", false, "check local /ready endpoint")
+	healthURL := flag.String("healthcheck-url", "", "healthcheck URL; default http://127.0.0.1:3300/ready")
 	flag.Parse()
 
 	if err := app.Run(context.Background(), app.Options{

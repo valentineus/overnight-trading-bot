@@ -30,7 +30,6 @@ func (l *Loader) SetClock(clock timeutil.Clock) {
 func (l Loader) BackfillDaily(ctx context.Context, instruments []domain.Instrument, from, to time.Time) error {
 	eligible := 0
 	succeeded := 0
-	var firstErr error
 	for _, instrument := range instruments {
 		if !instrument.Enabled || instrument.Quarantine {
 			continue
@@ -38,18 +37,15 @@ func (l Loader) BackfillDaily(ctx context.Context, instruments []domain.Instrume
 		eligible++
 		candles, err := l.gateway.GetCandles(ctx, instrument.InstrumentUID, "day", from, to)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("load candles %s: %w", instrument.Ticker, err)
-			}
-			continue
+			return fmt.Errorf("load daily candles %s: %w", instrument.Ticker, err)
 		}
 		if err := l.repo.UpsertDailyCandles(ctx, candles); err != nil {
 			return fmt.Errorf("persist candles %s: %w", instrument.Ticker, err)
 		}
 		succeeded++
 	}
-	if eligible > 0 && succeeded == 0 && firstErr != nil {
-		return fmt.Errorf("all daily candle loads failed: %w", firstErr)
+	if eligible > 0 && succeeded == 0 {
+		return fmt.Errorf("no daily candles loaded for eligible instruments")
 	}
 	return nil
 }
@@ -57,7 +53,6 @@ func (l Loader) BackfillDaily(ctx context.Context, instruments []domain.Instrume
 func (l Loader) BackfillMinute(ctx context.Context, instruments []domain.Instrument, from, to time.Time) error {
 	eligible := 0
 	succeeded := 0
-	var firstErr error
 	for _, instrument := range instruments {
 		if !instrument.Enabled || instrument.Quarantine {
 			continue
@@ -65,18 +60,15 @@ func (l Loader) BackfillMinute(ctx context.Context, instruments []domain.Instrum
 		eligible++
 		candles, err := l.gateway.GetCandles(ctx, instrument.InstrumentUID, "minute", from, to)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("load minute candles %s: %w", instrument.Ticker, err)
-			}
-			continue
+			return fmt.Errorf("load minute candles %s: %w", instrument.Ticker, err)
 		}
 		if err := l.repo.UpsertMinuteCandles(ctx, candles); err != nil {
 			return fmt.Errorf("persist minute candles %s: %w", instrument.Ticker, err)
 		}
 		succeeded++
 	}
-	if eligible > 0 && succeeded == 0 && firstErr != nil {
-		return fmt.Errorf("all minute candle loads failed: %w", firstErr)
+	if eligible > 0 && succeeded == 0 {
+		return fmt.Errorf("no minute candles loaded for eligible instruments")
 	}
 	return nil
 }

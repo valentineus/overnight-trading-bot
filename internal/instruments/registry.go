@@ -29,7 +29,7 @@ func (r Registry) SyncMetadata(ctx context.Context) error {
 		}
 		remote, err := r.gateway.GetInstrument(ctx, instrument.Ticker, instrument.ClassCode)
 		if err != nil {
-			continue
+			return fmt.Errorf("sync instrument metadata %s: %w", instrument.Ticker, err)
 		}
 		remote.Enabled = instrument.Enabled && remote.Enabled
 		remote.FundType = instrument.FundType
