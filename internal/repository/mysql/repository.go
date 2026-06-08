@@ -183,10 +183,14 @@ func (r *Repository) mergeInstrumentUID(ctx context.Context, oldInstrumentUID, n
 	if err := r.mergeFreeOrders(ctx, oldInstrumentUID, newInstrumentUID); err != nil {
 		return err
 	}
-	for _, table := range []string{"orders", "positions", "risk_events"} {
-		if _, err := r.execer().ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET instrument_uid=? WHERE instrument_uid=?`, table), newInstrumentUID, oldInstrumentUID); err != nil {
-			return err
-		}
+	if _, err := r.execer().ExecContext(ctx, `UPDATE orders SET instrument_uid=? WHERE instrument_uid=?`, newInstrumentUID, oldInstrumentUID); err != nil {
+		return err
+	}
+	if _, err := r.execer().ExecContext(ctx, `UPDATE positions SET instrument_uid=? WHERE instrument_uid=?`, newInstrumentUID, oldInstrumentUID); err != nil {
+		return err
+	}
+	if _, err := r.execer().ExecContext(ctx, `UPDATE risk_events SET instrument_uid=? WHERE instrument_uid=?`, newInstrumentUID, oldInstrumentUID); err != nil {
+		return err
 	}
 	_, err := r.execer().ExecContext(ctx, `DELETE FROM instruments WHERE instrument_uid=?`, oldInstrumentUID)
 	return err

@@ -267,6 +267,34 @@ func TestEntryFillDeltaUsesOnlyNewlyExecutedLots(t *testing.T) {
 	}
 }
 
+func TestEntryFillDeltaUsesStoredMonitorAggregate(t *testing.T) {
+	previous := domain.Order{
+		QuantityLots:  3,
+		FilledLots:    0,
+		AvgFillPrice:  decimal.Zero,
+		Commission:    decimal.Zero,
+		InstrumentUID: "uid",
+		RawStateJSON:  `{"local":{"monitor_aggregate":{"quantity_lots":5,"filled_lots":2,"avg_fill_price":"100","commission":"0.40"}}}`,
+	}
+	current := domain.Order{
+		QuantityLots:  5,
+		FilledLots:    4,
+		AvgFillPrice:  decimal.NewFromInt(110),
+		Commission:    decimal.NewFromInt(1),
+		InstrumentUID: "uid",
+	}
+	fill := entryFillDelta(previous, current)
+	if fill.FilledLots != 2 {
+		t.Fatalf("delta filled lots=%d, want 2 after stored aggregate", fill.FilledLots)
+	}
+	if !fill.AvgFillPrice.Equal(decimal.NewFromInt(120)) {
+		t.Fatalf("delta avg fill price=%s, want 120", fill.AvgFillPrice)
+	}
+	if !fill.Commission.Equal(decimal.RequireFromString("0.60")) {
+		t.Fatalf("delta commission=%s, want 0.60", fill.Commission)
+	}
+}
+
 func TestHardDeadlineMarksOpenPositionFailedAndHalts(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -421,6 +449,81 @@ func TestEntryInstrumentPreTradeRejectsQuarantineAndCommission(t *testing.T) {
 	}
 }
 
+func TestPlaceExitAllowsQuarantinedInstrumentForOpenPosition(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	openDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	exitDate := openDate.AddDate(0, 0, 1)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Ticker:               "TRUR",
+		ClassCode:            "TQTF",
+		Enabled:              true,
+		Quarantine:           true,
+		QuarantineReason:     "actual commission nonzero",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.RequireFromString("0.01"),
+		Currency:             "RUB",
+		FreeOrderLimitPerDay: -1,
+	}
+	if err := repo.UpsertInstrument(ctx, instrument); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertPosition(ctx, domain.Position{
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		OpenTradeDate: openDate,
+		Lots:          2,
+		Lot:           1,
+		AvgBuyPrice:   decimal.NewFromInt(100),
+		Status:        domain.PositionHoldingOvernight,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := tinvest.NewFakeGateway()
+	gateway.OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(100), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.RequireFromString("100.10"), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	execEngine := execution.NewEngine(domain.ModePaper, "account", gateway, repo)
+	s := Scheduler{
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			HardExitDeadline: mustTOD("23:00:00"),
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			Gateway:       gateway,
+			MarketData:    marketdata.NewLoader(repo, gateway),
+			Signals:       signalengine.New(signalengine.Config{}),
+			FreeOrders:    risk.NewFreeOrderBudget(repo),
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{}),
+			Execution:     &execEngine,
+			Positions:     position.NewManager(repo),
+			Notifier:      &countNotifier{},
+			AccountID:     "account",
+			AccountIDHash: "hash",
+		},
+	}
+	if err := repo.SaveSystemState(ctx, domain.StateWaitExitWindow, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.placeExitOrders(ctx, exitDate.Add(10*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := repo.ListOrders(ctx, "hash", exitDate, exitDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Side != domain.SideSell {
+		t.Fatalf("orders=%+v, want sell order for quarantined open position", orders)
+	}
+}
+
 func TestPreTradeDailyLossBreachHalts(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -458,6 +561,46 @@ func TestPreTradeDailyLossBreachHalts(t *testing.T) {
 	}
 	if notifier.alerts != 1 {
 		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
+func TestPreTradeUsesPhaseDeadlineForMinTimeToClose(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 8, 18, 37, 45, 0, time.UTC)
+	s := Scheduler{
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			NoNewEntryAfter:  mustTOD("18:38:30"),
+			HardExitDeadline: mustTOD("18:40:00"),
+			MarketClose:      mustTOD("23:00:00"),
+		},
+		svc: Services{
+			Repo:          repo,
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{MinTimeToClose: 90 * time.Second}),
+			AccountIDHash: "hash",
+		},
+	}
+	entry, err := s.preTradeCheck(ctx, now, "uid", domain.Portfolio{
+		Equity: decimal.NewFromInt(10000),
+		Cash:   decimal.NewFromInt(10000),
+	}, 0, false, domain.TradingStatusNormal, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Allowed || entry.Reason != "min_time_to_close_sec" {
+		t.Fatalf("entry result=%+v, want min_time_to_close_sec reject before NoNewEntryAfter", entry)
+	}
+	exit, err := s.preTradeCheck(ctx, now, "uid", domain.Portfolio{
+		Equity: decimal.NewFromInt(10000),
+		Cash:   decimal.NewFromInt(10000),
+	}, 1, true, domain.TradingStatusNormal, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exit.Allowed {
+		t.Fatalf("exit result=%+v, want allowed before HardExitDeadline", exit)
 	}
 }
 
@@ -555,6 +698,120 @@ func TestSizeReductionRuleCutsSizerAfterBadExpectedErrors(t *testing.T) {
 	}
 }
 
+func TestSizeReductionRuleBoundaryMinusTenDoesNotCut(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	tradeDate := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < sizeReductionWindowTrades; i++ {
+		date := tradeDate.AddDate(0, 0, -i)
+		if err := repo.UpsertSignal(ctx, domain.Signal{
+			TradeDate:     date,
+			InstrumentUID: "uid",
+			Decision:      domain.DecisionEnter,
+			NetEdgeBps:    decimal.NewFromInt(20),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.UpsertPosition(ctx, domain.Position{
+			AccountIDHash:   "hash",
+			InstrumentUID:   "uid",
+			OpenTradeDate:   date,
+			Lot:             1,
+			Status:          domain.PositionExitFilled,
+			RealizedEdgeBps: decimal.NewFromInt(10),
+			UpdatedAt:       date.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := Scheduler{
+		svc: Services{
+			Repo:          repo,
+			AccountIDHash: "hash",
+			Sizer: risk.NewSizer(risk.SizingConfig{
+				MaxPositionPct:             decimal.NewFromInt(1),
+				MaxTotalExposurePct:        decimal.NewFromInt(1),
+				MaxParticipationRate:       decimal.NewFromInt(1),
+				CashUsageBuffer:            decimal.NewFromInt(1),
+				RiskBudgetPerInstrumentPct: decimal.NewFromInt(1),
+				MinOrderNotionalRUB:        decimal.NewFromInt(1),
+			}),
+		},
+	}
+	if err := s.applySizeReductionRule(ctx, tradeDate, true); err != nil {
+		t.Fatal(err)
+	}
+	sized := s.svc.Sizer.Size(risk.SizingInput{
+		Portfolio:           domain.Portfolio{Equity: decimal.NewFromInt(10_000), Cash: decimal.NewFromInt(10_000)},
+		SelectedInstruments: 1,
+		LimitPrice:          decimal.NewFromInt(100),
+		Lot:                 1,
+		EntryIntervalVolume: decimal.NewFromInt(10_000),
+		ExitIntervalVolume:  decimal.NewFromInt(10_000),
+		Q05OvernightAbs:     decimal.NewFromInt(1),
+	})
+	if sized.Lots != 100 {
+		t.Fatalf("lots=%d, want unreduced 100 at -10.00 bps boundary", sized.Lots)
+	}
+	if len(repo.RiskEvents) != 0 {
+		t.Fatalf("risk events=%+v, want none at boundary", repo.RiskEvents)
+	}
+}
+
+func TestSizeReductionRuleRecommendsLiveReadonlyInLiveTrade(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	notifier := &countNotifier{}
+	tradeDate := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < sizeReductionWindowTrades; i++ {
+		date := tradeDate.AddDate(0, 0, -i)
+		if err := repo.UpsertSignal(ctx, domain.Signal{
+			TradeDate:     date,
+			InstrumentUID: "uid",
+			Decision:      domain.DecisionEnter,
+			NetEdgeBps:    decimal.NewFromInt(20),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.UpsertPosition(ctx, domain.Position{
+			AccountIDHash:   "hash",
+			InstrumentUID:   "uid",
+			OpenTradeDate:   date,
+			Lot:             1,
+			Status:          domain.PositionExitFilled,
+			RealizedEdgeBps: decimal.Zero,
+			UpdatedAt:       date.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := Scheduler{
+		cfg: Config{Mode: domain.ModeLiveTrade},
+		svc: Services{
+			Repo:          repo,
+			AccountIDHash: "hash",
+			Notifier:      notifier,
+			Sizer: risk.NewSizer(risk.SizingConfig{
+				MaxPositionPct:             decimal.NewFromInt(1),
+				MaxTotalExposurePct:        decimal.NewFromInt(1),
+				MaxParticipationRate:       decimal.NewFromInt(1),
+				CashUsageBuffer:            decimal.NewFromInt(1),
+				RiskBudgetPerInstrumentPct: decimal.NewFromInt(1),
+				MinOrderNotionalRUB:        decimal.NewFromInt(1),
+			}),
+		},
+	}
+	if err := s.applySizeReductionRule(ctx, tradeDate, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.RiskEvents) != 2 || repo.RiskEvents[1].EventType != "live_readonly_recommended" || repo.RiskEvents[1].Severity != domain.SeverityAlert {
+		t.Fatalf("risk events=%+v, want live_readonly recommendation alert", repo.RiskEvents)
+	}
+	if notifier.alerts != 1 {
+		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
 func TestBatchSignalLimitsCapSlotsAndExposure(t *testing.T) {
 	s := Scheduler{
 		cfg: Config{MaxOpenPositions: 5},
@@ -606,6 +863,57 @@ func TestBatchSignalLimitsCapSlotsAndExposure(t *testing.T) {
 	}
 	if generated[5].Signal.RejectReason != signalengine.ReasonMaxPositions {
 		t.Fatalf("sixth signal reason=%q, want max positions", generated[5].Signal.RejectReason)
+	}
+}
+
+func TestBatchSignalLimitsReserveCashAcrossCandidates(t *testing.T) {
+	s := Scheduler{
+		cfg: Config{MaxOpenPositions: 5},
+		svc: Services{Sizer: risk.NewSizer(risk.SizingConfig{
+			MaxPositionPct:             decimal.NewFromInt(1),
+			MaxTotalExposurePct:        decimal.NewFromInt(1),
+			MaxParticipationRate:       decimal.NewFromInt(1),
+			CashUsageBuffer:            decimal.NewFromInt(1),
+			RiskBudgetPerInstrumentPct: decimal.NewFromInt(1),
+			MinOrderNotionalRUB:        decimal.NewFromInt(1),
+		})},
+	}
+	book := domain.OrderBook{
+		Bids: []domain.OrderBookLevel{{Price: decimal.NewFromInt(100), QuantityLots: 10}},
+		Asks: []domain.OrderBookLevel{{Price: decimal.NewFromInt(102), QuantityLots: 10}},
+	}
+	generated := make([]signalCandidate, 0, 5)
+	for i := 0; i < 5; i++ {
+		uid := string(rune('a' + i))
+		generated = append(generated, signalCandidate{
+			Signal: domain.Signal{
+				InstrumentUID: uid,
+				Decision:      domain.DecisionEnter,
+				Score:         decimal.NewFromInt(int64(100 - i)),
+			},
+			Instrument: domain.Instrument{InstrumentUID: uid, Lot: 1, MinPriceIncrement: decimal.NewFromInt(1)},
+			Feature: domain.FeatureSet{
+				EntryIntervalVolume: decimal.NewFromInt(1_000_000),
+				ExitIntervalVolume:  decimal.NewFromInt(1_000_000),
+				Q05On60Abs:          decimal.NewFromInt(1),
+			},
+			Book: book,
+		})
+	}
+	s.applyBatchSignalLimits(domain.Portfolio{Equity: decimal.NewFromInt(100_000), Cash: decimal.NewFromInt(30_000)}, decimal.Zero, 0, generated)
+	enters := 0
+	total := decimal.Zero
+	for _, candidate := range generated {
+		if candidate.Signal.Decision == domain.DecisionEnter {
+			enters++
+			total = total.Add(candidate.Signal.TargetNotional)
+		}
+	}
+	if enters != 2 {
+		t.Fatalf("enter signals=%d, want only candidates that fit reserved cash", enters)
+	}
+	if total.GreaterThan(decimal.NewFromInt(30_000)) {
+		t.Fatalf("total target notional=%s exceeds cash", total)
 	}
 }
 

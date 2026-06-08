@@ -352,6 +352,50 @@ func TestLiveReadonlyDoesNotPersistLocalOrder(t *testing.T) {
 	}
 }
 
+func TestPlaceLimitModePolicy(t *testing.T) {
+	tests := []struct {
+		mode    domain.Mode
+		allowed bool
+	}{
+		{mode: domain.ModeBacktest, allowed: false},
+		{mode: domain.ModePaper, allowed: true},
+		{mode: domain.ModeSandbox, allowed: true},
+		{mode: domain.ModeLiveReadonly, allowed: false},
+		{mode: domain.ModeLiveTrade, allowed: true},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.mode), func(t *testing.T) {
+			ctx := context.Background()
+			repo := testutil.NewMemoryRepository()
+			engine := NewEngine(tt.mode, "account", tinvest.NewFakeGateway(), repo)
+			_, err := engine.PlaceLimit(ctx, domain.Order{
+				ClientOrderID: "order-" + string(tt.mode),
+				AccountIDHash: "hash",
+				InstrumentUID: "uid",
+				TradeDate:     time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC),
+				Side:          domain.SideBuy,
+				OrderType:     domain.OrderTypeLimit,
+				LimitPrice:    decimal.NewFromInt(100),
+				QuantityLots:  1,
+				Status:        domain.OrderStatusNew,
+				AttemptNo:     1,
+			})
+			if tt.allowed && err != nil {
+				t.Fatalf("PlaceLimit err=%v, want allowed", err)
+			}
+			if !tt.allowed && !errors.Is(err, ErrBrokerOrdersDisabled) {
+				t.Fatalf("PlaceLimit err=%v, want ErrBrokerOrdersDisabled", err)
+			}
+			if tt.allowed && len(repo.Orders) != 1 {
+				t.Fatalf("orders=%+v, want one persisted order", repo.Orders)
+			}
+			if !tt.allowed && len(repo.Orders) != 0 {
+				t.Fatalf("orders=%+v, want no persisted order", repo.Orders)
+			}
+		})
+	}
+}
+
 func TestMonitorUntilRepostsAndExpiresAtDeadline(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -496,11 +540,86 @@ func TestMonitorOnceRepostAccountsForFillsDuringCancel(t *testing.T) {
 	if monitored.FilledLots != 2 {
 		t.Fatalf("aggregate filled lots=%d, want cancel fill 2", monitored.FilledLots)
 	}
+	if !strings.Contains(monitored.RawStateJSON, "fill_quotes") {
+		t.Fatalf("fill quote snapshot was not recorded: %s", monitored.RawStateJSON)
+	}
 	if got := len(gateway.posted); got != 2 {
 		t.Fatalf("broker orders=%d, want initial+repost", got)
 	}
 	if got := gateway.posted[1].QuantityLots; got != 3 {
 		t.Fatalf("repost quantity lots=%d, want remaining 3", got)
+	}
+}
+
+func TestMonitorOnceAggregatesRepostsAcrossTicks(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := newCancelFillGateway(2)
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: -1,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 5, book, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order.CreatedAt = time.Now().UTC().Add(-time.Minute)
+	if err := repo.UpsertOrder(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	cfg := MonitorConfig{
+		Deadline:     time.Now().Add(time.Minute),
+		PollInterval: time.Millisecond,
+		MaxAttempts:  3,
+		RepostAfter:  time.Second,
+		Instrument:   instrument,
+		ImproveTicks: 1,
+		Quote: func(context.Context, string) (domain.OrderBook, error) {
+			book.ReceivedAt = time.Now().UTC()
+			return book, nil
+		},
+	}
+	first, err := engine.MonitorOnce(ctx, order, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FilledLots != 2 {
+		t.Fatalf("first aggregate filled lots=%d, want 2", first.FilledLots)
+	}
+	active, err := repo.ListActiveOrders(ctx, "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("active orders=%+v, want reposted order", active)
+	}
+	next := active[0]
+	next.CreatedAt = time.Now().UTC().Add(-time.Minute)
+	if err := repo.UpsertOrder(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.MonitorOnce(ctx, next, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.FilledLots != 4 {
+		t.Fatalf("second aggregate filled lots=%d, want 4 across reposts", second.FilledLots)
+	}
+	if got := len(gateway.posted); got != 3 {
+		t.Fatalf("broker orders=%d, want initial+two reposts", got)
+	}
+	if got := gateway.posted[2].QuantityLots; got != 1 {
+		t.Fatalf("second repost quantity lots=%d, want remaining 1", got)
 	}
 }
 

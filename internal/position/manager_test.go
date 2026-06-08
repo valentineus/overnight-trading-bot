@@ -2,6 +2,7 @@ package position
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -181,5 +182,36 @@ func TestOnExitFillUsesLotInRealizedEdgeCommissionBase(t *testing.T) {
 	}
 	if !updated.RealizedEdgeBps.Equal(decimal.NewFromInt(-10)) {
 		t.Fatalf("realized edge=%s, want -10 bps", updated.RealizedEdgeBps)
+	}
+}
+
+func TestOnExitFillRejectsOverfillWithCriticalRiskEvent(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	manager := NewManager(repo)
+	openAt := time.Now().UTC()
+	pos := domain.Position{
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		OpenTradeDate: openAt,
+		Lots:          3,
+		Lot:           1,
+		AvgBuyPrice:   decimal.NewFromInt(100),
+		Status:        domain.PositionHoldingOvernight,
+		OpenedAt:      &openAt,
+	}
+	updated, err := manager.OnExitFill(ctx, pos, domain.Order{
+		InstrumentUID: "uid",
+		FilledLots:    5,
+		AvgFillPrice:  decimal.NewFromInt(110),
+	})
+	if !errors.Is(err, ErrExitFillExceedsPositionLots) {
+		t.Fatalf("err=%v, want ErrExitFillExceedsPositionLots", err)
+	}
+	if updated.Lots != 3 || updated.Status != domain.PositionHoldingOvernight {
+		t.Fatalf("position was mutated despite overfill: %+v", updated)
+	}
+	if len(repo.RiskEvents) != 1 || repo.RiskEvents[0].Severity != domain.SeverityCritical || repo.RiskEvents[0].EventType != "exit_overfill" {
+		t.Fatalf("risk events=%+v, want one critical exit_overfill", repo.RiskEvents)
 	}
 }

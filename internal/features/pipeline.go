@@ -114,7 +114,6 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 	rawEdgeBps := decimal.NewFromFloat(short.Mean).Mul(decimal.NewFromInt(10_000))
 	commission := roundTripCommissionBps(instrument, cfg)
 	expectedCost := spread.SpreadBps.
-		Add(spread.SpreadBps).
 		Add(cfg.EntrySlippageBps).
 		Add(cfg.ExitSlippageBps).
 		Add(commission).

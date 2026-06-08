@@ -54,10 +54,16 @@ func (l SDKLogger) Fatalf(template string, args ...any) {
 
 var sensitiveStringPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)((?:account[_-]?id|token)\s*[:=]\s*)("[^"]+"|'[^']+'|[^\s,}]+)`),
-	regexp.MustCompile(`(?i)("(?:accountId|account_id|token)"\s*:\s*)("[^"]*"|null)`),
+	regexp.MustCompile(`(?i)("(?:accountID|accountId|account_id|token)"\s*:\s*)("[^"]*"|null)`),
 }
 
+var sensitiveAttrKeyPattern = regexp.MustCompile(`(?i)^(account[_-]?id|accountID|accountId|token)$`)
+
 func redactAttr(_ []string, attr slog.Attr) slog.Attr {
+	if sensitiveAttrKeyPattern.MatchString(attr.Key) {
+		attr.Value = slog.StringValue("[REDACTED]")
+		return attr
+	}
 	if attr.Value.Kind() == slog.KindString {
 		attr.Value = slog.StringValue(RedactString(attr.Value.String()))
 	}

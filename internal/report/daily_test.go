@@ -26,6 +26,23 @@ func TestAverageAdverseSlippageBpsUsesLocalQuoteMid(t *testing.T) {
 	}
 }
 
+func TestAverageAdverseSlippageBpsPrefersFillQuoteMid(t *testing.T) {
+	orders := []domain.Order{{
+		InstrumentUID: "uid",
+		Side:          domain.SideBuy,
+		LimitPrice:    decimal.NewFromInt(100),
+		FilledLots:    1,
+		AvgFillPrice:  decimal.NewFromFloat(102),
+		RawStateJSON:  `{"local":{"local_quote":{"mid":"100"},"fill_quotes":[{"mid":"101"}]}}`,
+		UpdatedAt:     time.Now().UTC(),
+	}}
+	got := AverageAdverseSlippageBps(orders, 0)
+	want := decimal.NewFromInt(10_000).Div(decimal.NewFromInt(101))
+	if got.Sub(want).Abs().GreaterThan(decimal.NewFromFloat(0.000001)) {
+		t.Fatalf("slippage=%s, want fill-mid based slippage", got)
+	}
+}
+
 func TestAverageAdverseSlippageBpsFallsBackToLimit(t *testing.T) {
 	orders := []domain.Order{{
 		InstrumentUID: "uid",

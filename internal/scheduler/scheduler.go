@@ -192,6 +192,8 @@ func (s *Scheduler) Step(ctx context.Context) error {
 }
 
 func (s Scheduler) phase(now time.Time) domain.SystemState {
+	// WAIT_ENTRY_WINDOW is a persisted checkpoint after signal generation; wall-clock
+	// phases move directly from GENERATE_SIGNALS to PLACE_ENTRY_ORDERS.
 	tod := sinceMidnight(now)
 	exitWindowStart := s.cfg.ExitWindowStart.Duration
 	if s.cfg.ExitNotBefore.Duration > exitWindowStart {
@@ -351,6 +353,7 @@ func (s Scheduler) applyBatchSignalLimits(portfolio domain.Portfolio, existingEx
 		}
 	}
 	selectedCount := remainingSlots
+	reservedCash := decimal.Zero
 	for rank, index := range enterIndexes {
 		candidate := &generated[index]
 		if rank >= remainingSlots {
@@ -360,7 +363,7 @@ func (s Scheduler) applyBatchSignalLimits(portfolio domain.Portfolio, existingEx
 			candidate.Signal.RejectReason = signal.ReasonMaxPositions
 			continue
 		}
-		sized, sizingErr := s.sizeSignal(portfolio, candidate.Instrument, candidate.Feature, candidate.Book, selectedCount, existingExposure, decimal.Zero)
+		sized, sizingErr := s.sizeSignal(portfolio, candidate.Instrument, candidate.Feature, candidate.Book, selectedCount, existingExposure, reservedCash)
 		switch {
 		case sizingErr != nil:
 			candidate.Signal.Decision = domain.DecisionReject
@@ -374,6 +377,7 @@ func (s Scheduler) applyBatchSignalLimits(portfolio domain.Portfolio, existingEx
 		default:
 			candidate.Signal.TargetLots = sized.Lots
 			candidate.Signal.TargetNotional = sized.TargetNotional
+			reservedCash = reservedCash.Add(sized.TargetNotional)
 		}
 	}
 }
@@ -582,7 +586,8 @@ func (s *Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error
 		if err != nil {
 			return err
 		}
-		if monitored.FilledLots > order.FilledLots || monitored.Commission.GreaterThan(order.Commission) {
+		previousFill := execution.AggregatedOrderFill(order)
+		if monitored.FilledLots > previousFill.FilledLots || monitored.Commission.GreaterThan(previousFill.Commission) {
 			fill := entryFillDelta(order, monitored)
 			if fill.FilledLots <= 0 && fill.Commission.IsZero() {
 				continue
@@ -758,7 +763,8 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 		if err != nil {
 			return err
 		}
-		if monitored.FilledLots > order.FilledLots || monitored.Commission.GreaterThan(order.Commission) {
+		previousFill := execution.AggregatedOrderFill(order)
+		if monitored.FilledLots > previousFill.FilledLots || monitored.Commission.GreaterThan(previousFill.Commission) {
 			fill := exitFillDelta(order, monitored)
 			if fill.FilledLots <= 0 && fill.Commission.IsZero() {
 				continue
@@ -902,12 +908,15 @@ func (s *Scheduler) applySizeReductionRule(ctx context.Context, tradeDate time.T
 	if !emitEvent {
 		return nil
 	}
-	return s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+	if err := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
 		Severity:    domain.SeverityWarn,
 		EventType:   "size_reduction_rule_triggered",
 		Message:     fmt.Sprintf("average expected_error_bps over %d trades is %s; sizing factor set to %s", count, averageError.StringFixed(2), factor.String()),
 		ContextJSON: fmt.Sprintf(`{"average_expected_error_bps":%q,"trades":%d,"size_factor":%q}`, averageError.String(), count, factor.String()),
-	})
+	}); err != nil {
+		return err
+	}
+	return s.recommendLiveReadonlyAfterSizeReduction(ctx, averageError, count, factor)
 }
 
 func (s Scheduler) averageExpectedErrorBps(ctx context.Context, tradeDate time.Time, limit int) (decimal.Decimal, int, bool, error) {
@@ -1242,7 +1251,7 @@ func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentU
 		TradingStatus:        tradingStatus,
 		QuoteReceivedAt:      quoteReceivedAt,
 		Now:                  now.UTC(),
-		MarketClose:          s.marketCloseOn(now),
+		MarketClose:          s.preTradeDeadlineOn(now, closingPosition),
 		UnknownBrokerOrder:   unknownOrder,
 		UnknownBrokerHolding: unknownHolding,
 	})
@@ -1371,6 +1380,38 @@ func (s Scheduler) marketCloseOn(now time.Time) time.Time {
 		return time.Time{}
 	}
 	return s.cfg.MarketClose.On(now, s.cfg.Location).UTC()
+}
+
+func (s Scheduler) preTradeDeadlineOn(now time.Time, closingPosition bool) time.Time {
+	if closingPosition && s.cfg.HardExitDeadline.Duration > 0 {
+		return s.cfg.HardExitDeadline.On(now, s.cfg.Location).UTC()
+	}
+	if !closingPosition && s.cfg.NoNewEntryAfter.Duration > 0 {
+		return s.cfg.NoNewEntryAfter.On(now, s.cfg.Location).UTC()
+	}
+	return s.marketCloseOn(now)
+}
+
+func (s Scheduler) recommendLiveReadonlyAfterSizeReduction(ctx context.Context, averageError decimal.Decimal, count int, factor decimal.Decimal) error {
+	if s.cfg.Mode != domain.ModeLiveTrade {
+		return nil
+	}
+	message := fmt.Sprintf("size reduction remains active after %d trades; consider switching to live_readonly until expected error recovers", count)
+	if s.svc.Notifier != nil {
+		_ = s.svc.Notifier.Alert(ctx, message)
+	}
+	return s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+		Severity:  domain.SeverityAlert,
+		EventType: "live_readonly_recommended",
+		Message:   message,
+		ContextJSON: fmt.Sprintf(
+			`{"average_expected_error_bps":%q,"trades":%d,"size_factor":%q,"recommended_mode":%q}`,
+			averageError.String(),
+			count,
+			factor.String(),
+			domain.ModeLiveReadonly,
+		),
+	})
 }
 
 func (s Scheduler) recordPreTradeReject(ctx context.Context, instrumentUID, message, contextJSON string) error {
@@ -1510,6 +1551,7 @@ func (s Scheduler) logWarn(msg string, args ...any) {
 }
 
 func entryFillDelta(previous, current domain.Order) domain.Order {
+	previous = execution.AggregatedOrderFill(previous)
 	fill := current
 	fill.FilledLots = current.FilledLots - previous.FilledLots
 	if fill.FilledLots < 0 {
@@ -1532,6 +1574,7 @@ func entryFillDelta(previous, current domain.Order) domain.Order {
 }
 
 func exitFillDelta(previous, current domain.Order) domain.Order {
+	previous = execution.AggregatedOrderFill(previous)
 	fill := current
 	fill.FilledLots = current.FilledLots - previous.FilledLots
 	if fill.FilledLots < 0 {

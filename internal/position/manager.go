@@ -2,6 +2,8 @@ package position
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -10,6 +12,8 @@ import (
 	"overnight-trading-bot/internal/money"
 	"overnight-trading-bot/internal/repository"
 )
+
+var ErrExitFillExceedsPositionLots = errors.New("exit fill exceeds local position lots")
 
 type Manager struct {
 	repo repository.Repository
@@ -109,7 +113,21 @@ func (m Manager) OnExitFill(ctx context.Context, pos domain.Position, exitOrder 
 	if lot <= 0 {
 		lot = 1
 	}
-	executedLots := min(exitOrder.FilledLots, pos.Lots)
+	if exitOrder.FilledLots > pos.Lots {
+		err := fmt.Errorf("%w: filled_lots=%d position_lots=%d instrument_uid=%s", ErrExitFillExceedsPositionLots, exitOrder.FilledLots, pos.Lots, pos.InstrumentUID)
+		if m.repo != nil {
+			_ = m.repo.InsertRiskEvent(ctx, domain.RiskEvent{
+				TS:            now,
+				Severity:      domain.SeverityCritical,
+				EventType:     "exit_overfill",
+				InstrumentUID: pos.InstrumentUID,
+				Message:       err.Error(),
+				ContextJSON:   fmt.Sprintf(`{"filled_lots":%d,"position_lots":%d}`, exitOrder.FilledLots, pos.Lots),
+			})
+		}
+		return pos, err
+	}
+	executedLots := exitOrder.FilledLots
 	if executedLots < 0 {
 		executedLots = 0
 	}

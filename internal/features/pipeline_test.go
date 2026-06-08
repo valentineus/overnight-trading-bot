@@ -41,8 +41,8 @@ func TestComputeExpectedCostIncludesCommissionAndSlippage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(32)) {
-		t.Fatalf("expected cost=%s, want 32", got.ExpectedCostBps)
+	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(22)) {
+		t.Fatalf("expected cost=%s, want 22", got.ExpectedCostBps)
 	}
 	if !got.EntryIntervalVolume.Equal(decimal.NewFromInt(10000)) || !got.ExitIntervalVolume.Equal(decimal.NewFromInt(9000)) {
 		t.Fatalf("interval volumes were not preserved: %+v", got)
@@ -66,8 +66,8 @@ func TestComputeExpectedCostFallsBackToConfigCommission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(34)) {
-		t.Fatalf("expected cost=%s, want 34", got.ExpectedCostBps)
+	if !got.ExpectedCostBps.Equal(decimal.NewFromInt(24)) {
+		t.Fatalf("expected cost=%s, want 24", got.ExpectedCostBps)
 	}
 }
 

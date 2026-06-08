@@ -77,6 +77,18 @@ func TestCalendarRecoveryAllowsRestartInsideExitWindow(t *testing.T) {
 	}
 }
 
+func TestSyncStatesCanRecoverToInit(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	system := New(repo, domain.ModePaper)
+	if err := system.Transition(ctx, domain.StateSyncInstruments, domain.StateInit); err != nil {
+		t.Fatalf("SYNC_INSTRUMENTS -> INIT should be legal recovery: %v", err)
+	}
+	if err := system.Transition(ctx, domain.StateSyncMarketData, domain.StateInit); err != nil {
+		t.Fatalf("SYNC_MARKET_DATA -> INIT should be legal recovery: %v", err)
+	}
+}
+
 func TestRecoverFromMonitorEntryHaltsOnCriticalReconciliationDiff(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

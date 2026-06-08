@@ -100,8 +100,8 @@ func legalTransition(from, to domain.SystemState) bool {
 	}
 	allowed := map[domain.SystemState][]domain.SystemState{
 		domain.StateInit:               {domain.StateSyncInstruments, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateGenerateSignals, domain.StatePlaceEntryOrders, domain.StateHoldOvernight, domain.StateReconcile, domain.StateSleep},
-		domain.StateSyncInstruments:    {domain.StateSyncMarketData},
-		domain.StateSyncMarketData:     {domain.StateGenerateSignals},
+		domain.StateSyncInstruments:    {domain.StateSyncMarketData, domain.StateInit},
+		domain.StateSyncMarketData:     {domain.StateGenerateSignals, domain.StateInit},
 		domain.StateGenerateSignals:    {domain.StateWaitEntryWindow, domain.StatePlaceEntryOrders, domain.StateHoldOvernight, domain.StateSleep},
 		domain.StateWaitEntryWindow:    {domain.StatePlaceEntryOrders, domain.StateSleep},
 		domain.StatePlaceEntryOrders:   {domain.StateMonitorEntryOrders, domain.StateHoldOvernight, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateReconcile},

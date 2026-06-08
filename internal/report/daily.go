@@ -135,10 +135,45 @@ func orderAdverseSlippageBps(order domain.Order) (decimal.Decimal, bool) {
 }
 
 func orderReferencePrice(order domain.Order) decimal.Decimal {
+	if mid := rawFillMidPrice(order.RawStateJSON); mid.IsPositive() {
+		return mid
+	}
 	if mid := rawMidPrice(order.RawStateJSON); mid.IsPositive() {
 		return mid
 	}
 	return order.LimitPrice
+}
+
+func rawFillMidPrice(raw string) decimal.Decimal {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		return decimal.Zero
+	}
+	if mid := fillMidFromContainer(root); mid.IsPositive() {
+		return mid
+	}
+	if local, ok := root["local"].(map[string]any); ok {
+		return fillMidFromContainer(local)
+	}
+	return decimal.Zero
+}
+
+func fillMidFromContainer(container map[string]any) decimal.Decimal {
+	quotes, ok := container["fill_quotes"].([]any)
+	if !ok || len(quotes) == 0 {
+		return decimal.Zero
+	}
+	for i := len(quotes) - 1; i >= 0; i-- {
+		quote, ok := quotes[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		mid, ok := decimalFromAny(quote["mid"])
+		if ok && mid.IsPositive() {
+			return mid
+		}
+	}
+	return decimal.Zero
 }
 
 func rawMidPrice(raw string) decimal.Decimal {

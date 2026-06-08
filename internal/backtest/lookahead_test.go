@@ -107,6 +107,34 @@ func TestEvaluateCandidateUsesInstrumentLotAndTick(t *testing.T) {
 	}
 }
 
+func TestEvaluateCandidateChargesOneFullSpreadRoundTrip(t *testing.T) {
+	requireZero := false
+	engine := New(Config{
+		RollingShort:           2,
+		RollingLong:            2,
+		MinTStat60:             decimal.NewFromInt(-1),
+		MinWinRate60:           decimal.NewFromFloat(0.1),
+		MinNetEdgeBps:          decimal.NewFromInt(-1000),
+		MinADVRUB:              decimal.NewFromInt(1),
+		AssumedSpreadBps:       decimal.NewFromInt(10),
+		EntrySlippageBps:       decimal.NewFromInt(2),
+		ExitSlippageBps:        decimal.NewFromInt(3),
+		CommissionRoundtripBps: decimal.NewFromInt(4),
+		RiskBufferBps:          decimal.NewFromInt(5),
+		RequireZeroCommission:  &requireZero,
+	})
+	got, ok, err := engine.evaluateCandidate("uid", candidateCandles("uid"), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected candidate")
+	}
+	if !got.netEdge.Equal(decimal.NewFromInt(126)) {
+		t.Fatalf("net edge=%s, want raw 150 - cost 24", got.netEdge)
+	}
+}
+
 func TestWindowCapacityUsesMinuteEntryAndExitWindows(t *testing.T) {
 	engine := New(Config{
 		Lot:                  10,

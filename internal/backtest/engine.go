@@ -250,11 +250,12 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 		for _, c := range dayCandidates {
 			entryIntervalVolume, exitIntervalVolume := e.windowVolumes(c, preparedMinutes[c.instrumentUID])
 			capacity := decimal.Zero
-			if entryIntervalVolume.IsPositive() && exitIntervalVolume.IsPositive() {
+			switch {
+			case entryIntervalVolume.IsPositive() && exitIntervalVolume.IsPositive():
 				capacity = money.Min(entryIntervalVolume, exitIntervalVolume).Mul(e.cfg.MaxParticipationRate)
-			} else if e.cfg.UseMinuteModel {
+			case e.cfg.UseMinuteModel:
 				continue
-			} else {
+			default:
 				entryIntervalVolume = e.unconstrainedIntervalVolume(equity)
 				exitIntervalVolume = entryIntervalVolume
 			}
@@ -469,7 +470,6 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 	rawEdge := decimal.NewFromFloat(short.Mean).Mul(decimal.NewFromInt(10_000))
 	spreadBps := e.assumedSpreadBps(instrumentUID)
 	cost := spreadBps.
-		Add(spreadBps).
 		Add(e.cfg.EntrySlippageBps).
 		Add(e.cfg.ExitSlippageBps).
 		Add(e.cfg.CommissionRoundtripBps).
