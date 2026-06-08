@@ -8,11 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/russianinvestments/invest-api-go-sdk/investgo"
 	pb "github.com/russianinvestments/invest-api-go-sdk/proto"
 	"github.com/shopspring/decimal"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -35,14 +38,15 @@ type Options struct {
 
 type RealGateway struct {
 	client         *investgo.Client
-	instruments    *investgo.InstrumentsServiceClient
-	marketData     *investgo.MarketDataServiceClient
-	orders         *investgo.OrdersServiceClient
-	operations     *investgo.OperationsServiceClient
-	users          *investgo.UsersServiceClient
+	instrumentsPB  pb.InstrumentsServiceClient
+	marketDataPB   pb.MarketDataServiceClient
+	ordersPB       pb.OrdersServiceClient
+	operationsPB   pb.OperationsServiceClient
+	usersPB        pb.UsersServiceClient
 	requestTimeout time.Duration
 	retryAttempts  int
 	retryBackoff   time.Duration
+	instrumentLots sync.Map
 }
 
 func NewRealGateway(ctx context.Context, opts Options) (*RealGateway, error) {
@@ -61,11 +65,11 @@ func NewRealGateway(ctx context.Context, opts Options) (*RealGateway, error) {
 	}
 	return &RealGateway{
 		client:         client,
-		instruments:    client.NewInstrumentsServiceClient(),
-		marketData:     client.NewMarketDataServiceClient(),
-		orders:         client.NewOrdersServiceClient(),
-		operations:     client.NewOperationsServiceClient(),
-		users:          client.NewUsersServiceClient(),
+		instrumentsPB:  pb.NewInstrumentsServiceClient(client.Conn),
+		marketDataPB:   pb.NewMarketDataServiceClient(client.Conn),
+		ordersPB:       pb.NewOrdersServiceClient(client.Conn),
+		operationsPB:   pb.NewOperationsServiceClient(client.Conn),
+		usersPB:        pb.NewUsersServiceClient(client.Conn),
 		requestTimeout: opts.RequestTimeout,
 		retryAttempts:  opts.RetryCount,
 		retryBackoff:   opts.RetryBackoff,
@@ -83,9 +87,13 @@ func (g *RealGateway) GetInstrument(ctx context.Context, ticker, classCode strin
 	if err := ctx.Err(); err != nil {
 		return domain.Instrument{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.EtfResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.EtfResponse, error) {
-			return g.instruments.EtfByTicker(ticker, classCode)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.EtfResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.EtfResponse, error) {
+			return g.instrumentsPB.EtfBy(callCtx, &pb.InstrumentRequest{
+				IdType:    pb.InstrumentIdType_INSTRUMENT_ID_TYPE_TICKER,
+				ClassCode: &classCode,
+				Id:        ticker,
+			})
 		})
 	})
 	if err != nil {
@@ -95,7 +103,7 @@ func (g *RealGateway) GetInstrument(ctx context.Context, ticker, classCode strin
 	if etf == nil {
 		return domain.Instrument{}, ErrNotFound
 	}
-	return domain.Instrument{
+	instrument := domain.Instrument{
 		InstrumentUID:     etf.GetUid(),
 		Figi:              etf.GetFigi(),
 		Ticker:            etf.GetTicker(),
@@ -106,16 +114,25 @@ func (g *RealGateway) GetInstrument(ctx context.Context, ticker, classCode strin
 		Currency:          strings.ToUpper(etf.GetCurrency()),
 		Enabled:           etf.GetApiTradeAvailableFlag() && etf.GetBuyAvailableFlag() && etf.GetSellAvailableFlag(),
 		UpdatedAt:         time.Now().UTC(),
-	}, nil
+	}
+	g.storeInstrumentLot(instrument)
+	return instrument, nil
 }
 
 func (g *RealGateway) GetCandles(ctx context.Context, instrumentUID string, interval string, from, to time.Time) ([]domain.Candle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetCandlesResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetCandlesResponse, error) {
-			return g.marketData.GetCandles(instrumentUID, candleInterval(interval), from, to, pb.GetCandlesRequest_CANDLE_SOURCE_EXCHANGE, 0)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.GetCandlesResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.GetCandlesResponse, error) {
+			source := pb.GetCandlesRequest_CANDLE_SOURCE_EXCHANGE
+			return g.marketDataPB.GetCandles(callCtx, &pb.GetCandlesRequest{
+				From:             investgo.TimeToTimestamp(from),
+				To:               investgo.TimeToTimestamp(to),
+				Interval:         candleInterval(interval),
+				InstrumentId:     &instrumentUID,
+				CandleSourceType: &source,
+			})
 		})
 	})
 	if err != nil {
@@ -143,9 +160,12 @@ func (g *RealGateway) GetOrderBook(ctx context.Context, instrumentUID string, de
 	if err := ctx.Err(); err != nil {
 		return domain.OrderBook{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetOrderBookResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetOrderBookResponse, error) {
-			return g.marketData.GetOrderBook(instrumentUID, depth)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.GetOrderBookResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.GetOrderBookResponse, error) {
+			return g.marketDataPB.GetOrderBook(callCtx, &pb.GetOrderBookRequest{
+				Depth:        depth,
+				InstrumentId: &instrumentUID,
+			})
 		})
 	})
 	if err != nil {
@@ -164,9 +184,11 @@ func (g *RealGateway) GetTradingStatus(ctx context.Context, instrumentUID string
 	if err := ctx.Err(); err != nil {
 		return domain.TradingStatusUnknown, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetTradingStatusResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetTradingStatusResponse, error) {
-			return g.marketData.GetTradingStatus(instrumentUID)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.GetTradingStatusResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.GetTradingStatusResponse, error) {
+			return g.marketDataPB.GetTradingStatus(callCtx, &pb.GetTradingStatusRequest{
+				InstrumentId: &instrumentUID,
+			})
 		})
 	})
 	if err != nil {
@@ -192,9 +214,9 @@ func (g *RealGateway) PostLimitOrder(ctx context.Context, accountID, instrumentU
 	if err != nil {
 		return domain.Order{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.PostOrderResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.PostOrderResponse, error) {
-			return g.orders.PostOrder(&investgo.PostOrderRequest{
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.PostOrderResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.PostOrderResponse, error) {
+			return g.ordersPB.PostOrder(callCtx, &pb.PostOrderRequest{
 				InstrumentId: instrumentUID,
 				Quantity:     lots,
 				Price:        quotation,
@@ -210,16 +232,19 @@ func (g *RealGateway) PostLimitOrder(ctx context.Context, accountID, instrumentU
 	if err != nil {
 		return domain.Order{}, err
 	}
-	return orderFromPostResponse(resp.PostOrderResponse, accountID, clientOrderID, side, price), nil
+	return orderFromPostResponse(resp, accountID, clientOrderID, side, price), nil
 }
 
 func (g *RealGateway) CancelOrder(ctx context.Context, accountID, orderID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := requestWithTimeout(ctx, g.requestTimeout, func() (struct{}, error) {
-		return struct{}{}, withRetry(ctx, g.retryAttempts, g.retryBackoff, func() error {
-			_, err := g.orders.CancelOrder(accountID, orderID, nil)
+	_, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (struct{}, error) {
+		return struct{}{}, withRetry(callCtx, g.retryAttempts, g.retryBackoff, func() error {
+			_, err := g.ordersPB.CancelOrder(callCtx, &pb.CancelOrderRequest{
+				AccountId: accountID,
+				OrderId:   orderID,
+			})
 			return err
 		})
 	})
@@ -230,24 +255,28 @@ func (g *RealGateway) GetOrderState(ctx context.Context, accountID, orderID stri
 	if err := ctx.Err(); err != nil {
 		return domain.Order{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetOrderStateResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetOrderStateResponse, error) {
-			return g.orders.GetOrderState(accountID, orderID, pb.PriceType_PRICE_TYPE_CURRENCY, nil)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.OrderState, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.OrderState, error) {
+			return g.ordersPB.GetOrderState(callCtx, &pb.GetOrderStateRequest{
+				AccountId: accountID,
+				OrderId:   orderID,
+				PriceType: pb.PriceType_PRICE_TYPE_CURRENCY,
+			})
 		})
 	})
 	if err != nil {
 		return domain.Order{}, err
 	}
-	return orderFromState(resp.OrderState, accountID), nil
+	return orderFromState(resp, accountID), nil
 }
 
 func (g *RealGateway) GetActiveOrders(ctx context.Context, accountID string) ([]domain.Order, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetOrdersResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetOrdersResponse, error) {
-			return g.orders.GetOrders(accountID, nil)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.GetOrdersResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.GetOrdersResponse, error) {
+			return g.ordersPB.GetOrders(callCtx, &pb.GetOrdersRequest{AccountId: accountID})
 		})
 	})
 	if err != nil {
@@ -265,34 +294,38 @@ func (g *RealGateway) GetPortfolio(ctx context.Context, accountID string) (domai
 	if err := ctx.Err(); err != nil {
 		return domain.Portfolio{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.PortfolioResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.PortfolioResponse, error) {
-			return g.operations.GetPortfolio(accountID, pb.PortfolioRequest_RUB)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.PortfolioResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.PortfolioResponse, error) {
+			currency := pb.PortfolioRequest_RUB
+			return g.operationsPB.GetPortfolio(callCtx, &pb.PortfolioRequest{
+				AccountId: accountID,
+				Currency:  &currency,
+			})
 		})
 	})
 	if err != nil {
 		return domain.Portfolio{}, err
 	}
-	return portfolioFromResponse(resp.PortfolioResponse)
+	return portfolioFromResponse(resp, g.lotForInstrument)
 }
 
 func (g *RealGateway) GetOperations(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.OperationsResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.OperationsResponse, error) {
-			return g.operations.GetOperations(&investgo.GetOperationsRequest{
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.OperationsResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.OperationsResponse, error) {
+			return g.operationsPB.GetOperations(callCtx, &pb.OperationsRequest{
 				AccountId: accountID,
-				From:      from,
-				To:        to,
+				From:      investgo.TimeToTimestamp(from),
+				To:        investgo.TimeToTimestamp(to),
 			})
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	return operationsFromResponse(resp.OperationsResponse), nil
+	return operationsFromResponse(resp), nil
 }
 
 func operationsFromResponse(resp *pb.OperationsResponse) []domain.Operation {
@@ -312,13 +345,13 @@ func operationsFromResponse(resp *pb.OperationsResponse) []domain.Operation {
 	return out
 }
 
-func portfolioFromResponse(resp *pb.PortfolioResponse) (domain.Portfolio, error) {
+func portfolioFromResponse(resp *pb.PortfolioResponse, lotForInstrument func(string) int64) (domain.Portfolio, error) {
 	positions := resp.GetPositions()
 	holdings := make([]domain.Holding, 0, len(positions))
 	for _, position := range positions {
 		holdings = append(holdings, domain.Holding{
 			InstrumentUID: position.GetInstrumentUid(),
-			QuantityLots:  portfolioQuantityLots(position),
+			QuantityLots:  portfolioQuantityLots(position, portfolioPositionLot(position, lotForInstrument)),
 			AveragePrice:  money.MoneyValueToDecimal(position.GetAveragePositionPrice()),
 			MarketValue:   money.MoneyValueToDecimal(position.GetCurrentPrice()).Mul(money.QuotationToDecimal(position.GetQuantity())),
 		})
@@ -343,15 +376,20 @@ func (g *RealGateway) GetServerTime(ctx context.Context) (time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetInfoResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetInfoResponse, error) {
-			return g.users.GetInfo()
+	header, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (metadata.MD, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (metadata.MD, error) {
+			var header, trailer metadata.MD
+			_, err := g.usersPB.GetInfo(callCtx, &pb.GetInfoRequest{}, grpc.Header(&header), grpc.Trailer(&trailer))
+			if err != nil {
+				return trailer, err
+			}
+			return header, nil
 		})
 	})
 	if err != nil {
 		return time.Time{}, err
 	}
-	if serverTime, ok := serverTimeFromHeader(resp.Header); ok {
+	if serverTime, ok := serverTimeFromHeader(header); ok {
 		return serverTime, nil
 	}
 	return time.Time{}, errors.New("server time is unavailable in response metadata")
@@ -376,14 +414,47 @@ func rubMoneyValueToDecimal(value *pb.MoneyValue) (decimal.Decimal, error) {
 	return money.MoneyValueToDecimal(value), nil
 }
 
-func portfolioQuantityLots(position *pb.PortfolioPosition) int64 {
+func portfolioPositionLot(position *pb.PortfolioPosition, lotForInstrument func(string) int64) int64 {
+	if position == nil || lotForInstrument == nil {
+		return 0
+	}
+	return lotForInstrument(position.GetInstrumentUid())
+}
+
+func portfolioQuantityLots(position *pb.PortfolioPosition, lot int64) int64 {
 	if position == nil {
 		return 0
 	}
 	if lots, ok := portfolioDeprecatedQuantityLots(position); ok {
 		return lots.IntPart()
 	}
-	return money.QuotationToDecimal(position.GetQuantity()).IntPart()
+	quantity := money.QuotationToDecimal(position.GetQuantity())
+	if lot > 0 {
+		return quantity.Div(decimal.NewFromInt(lot)).IntPart()
+	}
+	return quantity.IntPart()
+}
+
+func (g *RealGateway) storeInstrumentLot(instrument domain.Instrument) {
+	if instrument.InstrumentUID == "" || instrument.Lot <= 0 {
+		return
+	}
+	g.instrumentLots.Store(instrument.InstrumentUID, instrument.Lot)
+}
+
+func (g *RealGateway) lotForInstrument(instrumentUID string) int64 {
+	if instrumentUID == "" {
+		return 0
+	}
+	value, ok := g.instrumentLots.Load(instrumentUID)
+	if !ok {
+		return 0
+	}
+	lot, ok := value.(int64)
+	if !ok {
+		return 0
+	}
+	return lot
 }
 
 func portfolioDeprecatedQuantityLots(position *pb.PortfolioPosition) (decimal.Decimal, bool) {

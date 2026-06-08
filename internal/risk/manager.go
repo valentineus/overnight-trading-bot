@@ -33,6 +33,7 @@ type ManagerConfig struct {
 type PreTradeInput struct {
 	Portfolio            domain.Portfolio
 	OpenPositions        int
+	ClosingPosition      bool
 	DailyPnL             decimal.Decimal
 	WeeklyPnL            decimal.Decimal
 	MonthlyDrawdownPct   decimal.Decimal
@@ -91,7 +92,7 @@ func (m Manager) PreTradeCheck(input PreTradeInput) PreTradeResult {
 		return reject("trading_status_unknown_before_order")
 	case input.TradingStatus != domain.TradingStatusNormal:
 		return reject("trading_status_not_normal")
-	case m.cfg.MaxOpenPositions > 0 && input.OpenPositions >= m.cfg.MaxOpenPositions:
+	case !input.ClosingPosition && m.cfg.MaxOpenPositions > 0 && input.OpenPositions >= m.cfg.MaxOpenPositions:
 		return reject("max_open_positions")
 	case DailyLossBreached(input.DailyPnL, input.Portfolio.Equity, m.cfg.MaxDailyLossPct):
 		return reject("max_daily_loss")

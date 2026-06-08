@@ -63,26 +63,11 @@ func retryValue[T any](ctx context.Context, attempts int, interval time.Duration
 	return out, nil
 }
 
-func requestWithTimeout[T any](ctx context.Context, timeout time.Duration, fn func() (T, error)) (T, error) {
+func requestWithTimeout[T any](ctx context.Context, timeout time.Duration, fn func(context.Context) (T, error)) (T, error) {
 	if timeout <= 0 {
-		return fn()
+		return fn(ctx)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	type result struct {
-		value T
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		value, err := fn()
-		done <- result{value: value, err: err}
-	}()
-	select {
-	case res := <-done:
-		return res.value, res.err
-	case <-callCtx.Done():
-		var zero T
-		return zero, callCtx.Err()
-	}
+	return fn(callCtx)
 }

@@ -162,6 +162,36 @@ func TestExitFillDeltaUsesOnlyNewlyExecutedLots(t *testing.T) {
 	}
 }
 
+func TestEntryFillDeltaUsesOnlyNewlyExecutedLots(t *testing.T) {
+	previous := domain.Order{
+		QuantityLots:  10,
+		FilledLots:    4,
+		AvgFillPrice:  decimal.NewFromInt(100),
+		Commission:    decimal.NewFromFloat(0.40),
+		InstrumentUID: "uid",
+	}
+	current := domain.Order{
+		QuantityLots:  10,
+		FilledLots:    10,
+		AvgFillPrice:  decimal.NewFromInt(106),
+		Commission:    decimal.NewFromFloat(1.00),
+		InstrumentUID: "uid",
+	}
+	fill := entryFillDelta(previous, current)
+	if fill.FilledLots != 6 {
+		t.Fatalf("delta filled lots=%d, want 6", fill.FilledLots)
+	}
+	if fill.QuantityLots != 6 {
+		t.Fatalf("delta quantity lots=%d, want 6 remaining target", fill.QuantityLots)
+	}
+	if !fill.AvgFillPrice.Equal(decimal.NewFromInt(110)) {
+		t.Fatalf("delta avg fill price=%s, want 110", fill.AvgFillPrice)
+	}
+	if !fill.Commission.Equal(decimal.NewFromFloat(0.60)) {
+		t.Fatalf("delta commission=%s, want 0.60", fill.Commission)
+	}
+}
+
 func TestHardDeadlineMarksOpenPositionFailedAndHalts(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -344,7 +374,7 @@ func TestPreTradeDailyLossBreachHalts(t *testing.T) {
 	_, err := s.preTradeCheck(ctx, now, "uid", domain.Portfolio{
 		Equity: decimal.NewFromInt(10000),
 		Cash:   decimal.NewFromInt(10000),
-	}, 0, domain.TradingStatusNormal, now)
+	}, 0, false, domain.TradingStatusNormal, now)
 	if !errors.Is(err, statemachine.ErrSystemHalted) {
 		t.Fatalf("err=%v, want ErrSystemHalted", err)
 	}

@@ -37,3 +37,29 @@ func TestMarshalProtoRedactsAccountID(t *testing.T) {
 		t.Fatalf("sanitizer removed non-sensitive data: %s", raw)
 	}
 }
+
+func TestPortfolioFromResponseConvertsUnitsToLots(t *testing.T) {
+	portfolio, err := portfolioFromResponse(&pb.PortfolioResponse{
+		Positions: []*pb.PortfolioPosition{
+			{
+				InstrumentUid: "uid",
+				Quantity:      &pb.Quotation{Units: 20},
+				CurrentPrice:  &pb.MoneyValue{Currency: "rub", Units: 10},
+			},
+		},
+	}, func(instrumentUID string) int64 {
+		if instrumentUID == "uid" {
+			return 10
+		}
+		return 0
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := portfolio.Holdings[0].QuantityLots; got != 2 {
+		t.Fatalf("quantity lots=%d, want 2", got)
+	}
+	if !portfolio.Holdings[0].MarketValue.Equal(decimal.NewFromInt(200)) {
+		t.Fatalf("market value=%s, want 200", portfolio.Holdings[0].MarketValue)
+	}
+}

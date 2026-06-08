@@ -51,6 +51,12 @@ type MonitorConfig struct {
 	RepostCheck  func(ctx context.Context, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error
 }
 
+type repostResult struct {
+	Current   domain.Order
+	Changed   bool
+	Cancelled domain.Order
+}
+
 func NewEngine(mode domain.Mode, accountID string, gateway Gateway, store repository.Repository) Engine {
 	return Engine{
 		mode:                 mode,
@@ -346,13 +352,25 @@ func (e *Engine) MonitorUntil(ctx context.Context, order domain.Order, cfg Monit
 			aggregate.FilledLots < aggregate.QuantityLots &&
 			cfg.Quote != nil
 		if shouldRepost {
-			next, reposted, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+			result, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+			if result.Cancelled.ClientOrderID != "" {
+				previous := seen[result.Cancelled.ClientOrderID]
+				aggregate = mergeAggregateFill(aggregate, previous, result.Cancelled)
+				seen[result.Cancelled.ClientOrderID] = result.Cancelled
+				if aggregate.FilledLots >= aggregate.QuantityLots {
+					aggregate.Status = domain.OrderStatusFilled
+					return aggregate, nil
+				}
+			}
 			if err != nil {
 				return aggregate, err
 			}
-			if reposted {
-				current = next
+			if result.Changed {
+				current = result.Current
 				seen[current.ClientOrderID] = current
+				aggregate.Status = current.Status
+				aggregate.UpdatedAt = current.UpdatedAt
+				aggregate.RawStateJSON = current.RawStateJSON
 			}
 			lastPost = e.nowUTC()
 			continue
@@ -405,71 +423,86 @@ func (e *Engine) MonitorOnce(ctx context.Context, order domain.Order, cfg Monito
 		aggregate.FilledLots < aggregate.QuantityLots &&
 		cfg.Quote != nil
 	if shouldRepost {
-		next, reposted, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+		result, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+		if result.Cancelled.ClientOrderID != "" {
+			aggregate = mergeAggregateFill(aggregate, current, result.Cancelled)
+			if aggregate.FilledLots >= aggregate.QuantityLots {
+				aggregate.Status = domain.OrderStatusFilled
+				return aggregate, nil
+			}
+		}
 		if err != nil {
 			return aggregate, err
 		}
-		if reposted {
-			aggregate.BrokerOrderID = next.BrokerOrderID
-			aggregate.ClientOrderID = next.ClientOrderID
-			aggregate.Status = next.Status
-			aggregate.RawStateJSON = next.RawStateJSON
-			aggregate.UpdatedAt = next.UpdatedAt
+		if result.Changed {
+			aggregate.BrokerOrderID = result.Current.BrokerOrderID
+			aggregate.ClientOrderID = result.Current.ClientOrderID
+			aggregate.Status = result.Current.Status
+			aggregate.RawStateJSON = result.Current.RawStateJSON
+			aggregate.UpdatedAt = result.Current.UpdatedAt
 		}
 	}
 	return aggregate, nil
 }
 
-func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConfig, remaining int64) (domain.Order, bool, error) {
+func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConfig, remaining int64) (repostResult, error) {
 	if err := e.ensureRepostBudget(ctx, order, cfg.Instrument); err != nil {
-		return domain.Order{}, false, err
+		return repostResult{}, err
 	}
 	if !cfg.Deadline.IsZero() && !e.nowUTC().Before(cfg.Deadline) {
-		return order, false, nil
+		return repostResult{Current: order}, nil
 	}
 	book, err := cfg.Quote(ctx, order.InstrumentUID)
 	if err != nil {
-		return domain.Order{}, false, err
+		return repostResult{}, err
 	}
 	if cfg.RepostCheck != nil {
 		if err := cfg.RepostCheck(ctx, order, cfg.Instrument, book); err != nil {
-			return order, false, nil
+			return repostResult{Current: order}, nil
 		}
 	}
 	if err := e.Cancel(ctx, order); err != nil {
-		return domain.Order{}, false, err
+		return repostResult{}, err
 	}
 	cancelled, err := e.waitTerminal(ctx, order, cfg)
 	if err != nil {
-		return domain.Order{}, false, err
+		return repostResult{}, err
+	}
+	result := repostResult{Current: cancelled, Changed: true, Cancelled: cancelled}
+	additionalFilled := cancelled.FilledLots - order.FilledLots
+	if additionalFilled > 0 {
+		remaining -= additionalFilled
 	}
 	if remaining <= 0 {
-		cancelled.Status = domain.OrderStatusFilled
-		return cancelled, true, nil
+		return result, nil
 	}
 	if !cfg.Deadline.IsZero() && !e.nowUTC().Before(cfg.Deadline) {
-		return cancelled, true, nil
+		return result, nil
 	}
 	book, err = cfg.Quote(ctx, order.InstrumentUID)
 	if err != nil {
-		return domain.Order{}, false, err
+		return result, err
 	}
 	if cfg.RepostCheck != nil {
 		if err := cfg.RepostCheck(ctx, cancelled, cfg.Instrument, book); err != nil {
-			return cancelled, true, nil
+			return result, nil
 		}
 	}
 	attempt := order.AttemptNo + 1
+	var next domain.Order
 	switch order.Side {
 	case domain.SideBuy:
-		next, err := e.PlaceEntry(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
-		return next, true, err
+		next, err = e.PlaceEntry(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
 	case domain.SideSell:
-		next, err := e.PlaceExit(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
-		return next, true, err
+		next, err = e.PlaceExit(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
 	default:
-		return domain.Order{}, false, fmt.Errorf("unsupported side %s", order.Side)
+		return result, fmt.Errorf("unsupported side %s", order.Side)
 	}
+	if err != nil {
+		return result, err
+	}
+	result.Current = next
+	return result, nil
 }
 
 func (e *Engine) waitTerminal(ctx context.Context, order domain.Order, cfg MonitorConfig) (domain.Order, error) {

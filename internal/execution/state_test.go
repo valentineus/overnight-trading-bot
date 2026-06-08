@@ -342,3 +342,164 @@ func TestMonitorOnceDoesNotRepostWhenCheckRejects(t *testing.T) {
 		t.Fatalf("broker orders=%d, want no repost", got)
 	}
 }
+
+func TestMonitorOnceRepostAccountsForFillsDuringCancel(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := newCancelFillGateway(2)
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: -1,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 5, book, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order.CreatedAt = time.Now().UTC().Add(-time.Minute)
+	if err := repo.UpsertOrder(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	monitored, err := engine.MonitorOnce(ctx, order, MonitorConfig{
+		Deadline:     time.Now().Add(time.Minute),
+		PollInterval: time.Millisecond,
+		MaxAttempts:  2,
+		RepostAfter:  time.Second,
+		Instrument:   instrument,
+		ImproveTicks: 1,
+		Quote: func(context.Context, string) (domain.OrderBook, error) {
+			book.ReceivedAt = time.Now().UTC()
+			return book, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if monitored.FilledLots != 2 {
+		t.Fatalf("aggregate filled lots=%d, want cancel fill 2", monitored.FilledLots)
+	}
+	if got := len(gateway.posted); got != 2 {
+		t.Fatalf("broker orders=%d, want initial+repost", got)
+	}
+	if got := gateway.posted[1].QuantityLots; got != 3 {
+		t.Fatalf("repost quantity lots=%d, want remaining 3", got)
+	}
+}
+
+func TestMonitorOnceKeepsCancelFillWhenRepostPostFails(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := newCancelFillGateway(2)
+	gateway.failPostAfter = 1
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: -1,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 5, book, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order.CreatedAt = time.Now().UTC().Add(-time.Minute)
+	if err := repo.UpsertOrder(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	monitored, err := engine.MonitorOnce(ctx, order, MonitorConfig{
+		Deadline:     time.Now().Add(time.Minute),
+		PollInterval: time.Millisecond,
+		MaxAttempts:  2,
+		RepostAfter:  time.Second,
+		Instrument:   instrument,
+		ImproveTicks: 1,
+		Quote: func(context.Context, string) (domain.OrderBook, error) {
+			book.ReceivedAt = time.Now().UTC()
+			return book, nil
+		},
+	})
+	if err == nil {
+		t.Fatal("expected repost post error")
+	}
+	if monitored.FilledLots != 2 {
+		t.Fatalf("aggregate filled lots=%d, want cancel fill 2 despite error", monitored.FilledLots)
+	}
+}
+
+type cancelFillGateway struct {
+	orders           map[string]domain.Order
+	posted           []domain.Order
+	fillLotsOnCancel int64
+	failPostAfter    int
+}
+
+func newCancelFillGateway(fillLotsOnCancel int64) *cancelFillGateway {
+	return &cancelFillGateway{
+		orders:           make(map[string]domain.Order),
+		fillLotsOnCancel: fillLotsOnCancel,
+	}
+}
+
+func (g *cancelFillGateway) PostLimitOrder(_ context.Context, accountID, instrumentUID string, side domain.Side, lots int64, price decimal.Decimal, clientOrderID string) (domain.Order, error) {
+	if g.failPostAfter > 0 && len(g.posted) >= g.failPostAfter {
+		return domain.Order{}, errors.New("post failed")
+	}
+	now := time.Now().UTC()
+	order := domain.Order{
+		ClientOrderID: clientOrderID,
+		BrokerOrderID: "broker-" + clientOrderID,
+		AccountIDHash: accountID,
+		InstrumentUID: instrumentUID,
+		Side:          side,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    price,
+		QuantityLots:  lots,
+		Status:        domain.OrderStatusSent,
+		RawStateJSON:  "{}",
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	g.orders[order.BrokerOrderID] = order
+	g.posted = append(g.posted, order)
+	return order, nil
+}
+
+func (g *cancelFillGateway) CancelOrder(_ context.Context, _ string, orderID string) error {
+	order, ok := g.orders[orderID]
+	if !ok {
+		return tinvest.ErrNotFound
+	}
+	fillLots := min(g.fillLotsOnCancel, order.QuantityLots)
+	if fillLots > order.FilledLots {
+		order.FilledLots = fillLots
+		order.AvgFillPrice = order.LimitPrice
+	}
+	order.Status = domain.OrderStatusCancelled
+	order.UpdatedAt = time.Now().UTC()
+	g.orders[orderID] = order
+	return nil
+}
+
+func (g *cancelFillGateway) GetOrderState(_ context.Context, _ string, orderID string) (domain.Order, error) {
+	order, ok := g.orders[orderID]
+	if !ok {
+		return domain.Order{}, tinvest.ErrNotFound
+	}
+	return order, nil
+}

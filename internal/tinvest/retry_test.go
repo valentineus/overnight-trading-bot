@@ -25,9 +25,9 @@ func TestWithRetryRetriesUntilSuccess(t *testing.T) {
 }
 
 func TestRequestWithTimeoutReturnsDeadline(t *testing.T) {
-	_, err := requestWithTimeout(context.Background(), time.Millisecond, func() (int, error) {
-		time.Sleep(50 * time.Millisecond)
-		return 1, nil
+	_, err := requestWithTimeout(context.Background(), time.Millisecond, func(ctx context.Context) (int, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
 	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err=%v, want DeadlineExceeded", err)

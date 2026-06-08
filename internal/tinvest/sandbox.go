@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/russianinvestments/invest-api-go-sdk/investgo"
 	pb "github.com/russianinvestments/invest-api-go-sdk/proto"
 	"github.com/shopspring/decimal"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/money"
@@ -16,7 +16,7 @@ const sandboxEndpoint = "sandbox-invest-public-api.tinkoff.ru:443"
 
 type SandboxGateway struct {
 	*RealGateway
-	sandbox *investgo.SandboxServiceClient
+	sandboxPB pb.SandboxServiceClient
 }
 
 func NewSandboxGateway(ctx context.Context, opts Options) (*SandboxGateway, error) {
@@ -27,7 +27,7 @@ func NewSandboxGateway(ctx context.Context, opts Options) (*SandboxGateway, erro
 	}
 	return &SandboxGateway{
 		RealGateway: realGateway,
-		sandbox:     realGateway.client.NewSandboxServiceClient(),
+		sandboxPB:   pb.NewSandboxServiceClient(realGateway.client.Conn),
 	}, nil
 }
 
@@ -43,9 +43,9 @@ func (g *SandboxGateway) PostLimitOrder(ctx context.Context, accountID, instrume
 	if err != nil {
 		return domain.Order{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.PostOrderResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.PostOrderResponse, error) {
-			return g.sandbox.PostSandboxOrder(&investgo.PostOrderRequest{
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.PostOrderResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.PostOrderResponse, error) {
+			return g.sandboxPB.PostSandboxOrder(callCtx, &pb.PostOrderRequest{
 				InstrumentId: instrumentUID,
 				Quantity:     lots,
 				Price:        quotation,
@@ -61,16 +61,19 @@ func (g *SandboxGateway) PostLimitOrder(ctx context.Context, accountID, instrume
 	if err != nil {
 		return domain.Order{}, err
 	}
-	return orderFromPostResponse(resp.PostOrderResponse, accountID, clientOrderID, side, price), nil
+	return orderFromPostResponse(resp, accountID, clientOrderID, side, price), nil
 }
 
 func (g *SandboxGateway) CancelOrder(ctx context.Context, accountID, orderID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := requestWithTimeout(ctx, g.requestTimeout, func() (struct{}, error) {
-		return struct{}{}, withRetry(ctx, g.retryAttempts, g.retryBackoff, func() error {
-			_, err := g.sandbox.CancelSandboxOrder(accountID, orderID)
+	_, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (struct{}, error) {
+		return struct{}{}, withRetry(callCtx, g.retryAttempts, g.retryBackoff, func() error {
+			_, err := g.sandboxPB.CancelSandboxOrder(callCtx, &pb.CancelOrderRequest{
+				AccountId: accountID,
+				OrderId:   orderID,
+			})
 			return err
 		})
 	})
@@ -81,24 +84,28 @@ func (g *SandboxGateway) GetOrderState(ctx context.Context, accountID, orderID s
 	if err := ctx.Err(); err != nil {
 		return domain.Order{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetOrderStateResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetOrderStateResponse, error) {
-			return g.sandbox.GetSandboxOrderState(accountID, orderID)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.OrderState, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.OrderState, error) {
+			return g.sandboxPB.GetSandboxOrderState(callCtx, &pb.GetOrderStateRequest{
+				AccountId: accountID,
+				OrderId:   orderID,
+				PriceType: pb.PriceType_PRICE_TYPE_CURRENCY,
+			})
 		})
 	})
 	if err != nil {
 		return domain.Order{}, err
 	}
-	return orderFromState(resp.OrderState, accountID), nil
+	return orderFromState(resp, accountID), nil
 }
 
 func (g *SandboxGateway) GetActiveOrders(ctx context.Context, accountID string) ([]domain.Order, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.GetOrdersResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.GetOrdersResponse, error) {
-			return g.sandbox.GetSandboxOrders(accountID)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.GetOrdersResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.GetOrdersResponse, error) {
+			return g.sandboxPB.GetSandboxOrders(callCtx, &pb.GetOrdersRequest{AccountId: accountID})
 		})
 	})
 	if err != nil {
@@ -116,32 +123,36 @@ func (g *SandboxGateway) GetPortfolio(ctx context.Context, accountID string) (do
 	if err := ctx.Err(); err != nil {
 		return domain.Portfolio{}, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.PortfolioResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.PortfolioResponse, error) {
-			return g.sandbox.GetSandboxPortfolio(accountID, pb.PortfolioRequest_RUB)
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.PortfolioResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.PortfolioResponse, error) {
+			currency := pb.PortfolioRequest_RUB
+			return g.sandboxPB.GetSandboxPortfolio(callCtx, &pb.PortfolioRequest{
+				AccountId: accountID,
+				Currency:  &currency,
+			})
 		})
 	})
 	if err != nil {
 		return domain.Portfolio{}, err
 	}
-	return portfolioFromResponse(resp.PortfolioResponse)
+	return portfolioFromResponse(resp, g.lotForInstrument)
 }
 
 func (g *SandboxGateway) GetOperations(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	resp, err := requestWithTimeout(ctx, g.requestTimeout, func() (*investgo.OperationsResponse, error) {
-		return retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.OperationsResponse, error) {
-			return g.sandbox.GetSandboxOperations(&investgo.GetOperationsRequest{
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.OperationsResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.OperationsResponse, error) {
+			return g.sandboxPB.GetSandboxOperations(callCtx, &pb.OperationsRequest{
 				AccountId: accountID,
-				From:      from,
-				To:        to,
+				From:      timestamppb.New(from),
+				To:        timestamppb.New(to),
 			})
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	return operationsFromResponse(resp.OperationsResponse), nil
+	return operationsFromResponse(resp), nil
 }

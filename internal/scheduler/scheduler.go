@@ -492,7 +492,7 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 			}
 			continue
 		}
-		pre, err := s.preTradeCheck(ctx, now, sig.InstrumentUID, portfolio, projectedOpenPositions, tradingStatus, book.ReceivedAt)
+		pre, err := s.preTradeCheck(ctx, now, sig.InstrumentUID, portfolio, projectedOpenPositions, false, tradingStatus, book.ReceivedAt)
 		if err != nil {
 			return err
 		}
@@ -567,7 +567,11 @@ func (s *Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error
 			return err
 		}
 		if monitored.FilledLots > order.FilledLots || monitored.Commission.GreaterThan(order.Commission) {
-			if err := s.recordEntryFill(ctx, instrument, monitored); err != nil {
+			fill := entryFillDelta(order, monitored)
+			if fill.FilledLots <= 0 && fill.Commission.IsZero() {
+				continue
+			}
+			if err := s.recordEntryFill(ctx, instrument, fill); err != nil {
 				return err
 			}
 		}
@@ -660,7 +664,7 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return err
 		}
-		pre, err := s.preTradeCheck(ctx, now, pos.InstrumentUID, portfolio, len(positionsList), tradingStatus, book.ReceivedAt)
+		pre, err := s.preTradeCheck(ctx, now, pos.InstrumentUID, portfolio, len(positionsList), true, tradingStatus, book.ReceivedAt)
 		if err != nil {
 			return err
 		}
@@ -1173,7 +1177,7 @@ func (s Scheduler) repostPreTradeCheck(ctx context.Context, now time.Time, order
 	if err != nil {
 		return err
 	}
-	pre, err := s.preTradeCheck(ctx, now, order.InstrumentUID, portfolio, len(openPositions), tradingStatus, book.ReceivedAt)
+	pre, err := s.preTradeCheck(ctx, now, order.InstrumentUID, portfolio, len(openPositions), order.Side == domain.SideSell, tradingStatus, book.ReceivedAt)
 	if err != nil {
 		return err
 	}
@@ -1194,7 +1198,7 @@ func (s Scheduler) checkEntryInstrumentBeforeOrder(instrument domain.Instrument,
 	return nil
 }
 
-func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentUID string, portfolio domain.Portfolio, openPositions int, tradingStatus domain.TradingStatus, quoteReceivedAt time.Time) (risk.PreTradeResult, error) {
+func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentUID string, portfolio domain.Portfolio, openPositions int, closingPosition bool, tradingStatus domain.TradingStatus, quoteReceivedAt time.Time) (risk.PreTradeResult, error) {
 	metrics, err := s.riskMetrics(ctx, now, portfolio)
 	if err != nil {
 		if haltErr := s.halt(ctx, "database_unavailable", fmt.Sprintf("pre-trade risk metrics unavailable: %s", err), instrumentUID); haltErr != nil {
@@ -1209,6 +1213,7 @@ func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, instrumentU
 	result := s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
 		Portfolio:            portfolio,
 		OpenPositions:        openPositions,
+		ClosingPosition:      closingPosition,
 		DailyPnL:             metrics.dailyPnL,
 		WeeklyPnL:            metrics.weeklyPnL,
 		MonthlyDrawdownPct:   metrics.monthlyDrawdownPct,
@@ -1507,6 +1512,28 @@ func (s Scheduler) logWarn(msg string, args ...any) {
 	if s.svc.Log != nil {
 		s.svc.Log.Warn(msg, args...)
 	}
+}
+
+func entryFillDelta(previous, current domain.Order) domain.Order {
+	fill := current
+	fill.FilledLots = current.FilledLots - previous.FilledLots
+	if fill.FilledLots < 0 {
+		fill.FilledLots = 0
+	}
+	fill.Commission = current.Commission.Sub(previous.Commission)
+	if fill.Commission.IsNegative() {
+		fill.Commission = decimal.Zero
+	}
+	if fill.FilledLots > 0 {
+		currentValue := current.AvgFillPrice.Mul(decimal.NewFromInt(current.FilledLots))
+		previousValue := previous.AvgFillPrice.Mul(decimal.NewFromInt(previous.FilledLots))
+		fill.AvgFillPrice = currentValue.Sub(previousValue).Div(decimal.NewFromInt(fill.FilledLots))
+	}
+	fill.QuantityLots = current.QuantityLots - previous.FilledLots
+	if fill.QuantityLots < 0 {
+		fill.QuantityLots = 0
+	}
+	return fill
 }
 
 func exitFillDelta(previous, current domain.Order) domain.Order {
