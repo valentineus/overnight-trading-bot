@@ -35,6 +35,21 @@ func TestRepositoryMariaDBMigrationsAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	migrationDB, err := sqlx.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = migrationDB.Close()
+	})
+	if err := migrationDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, migrationDB.DB); err != nil {
+		t.Fatal(err)
+	}
+	_ = migrationDB.Close()
+
 	db, err := sqlx.Open("mysql", dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -43,9 +58,6 @@ func TestRepositoryMariaDBMigrationsAndRoundTrip(t *testing.T) {
 		_ = db.Close()
 	})
 	if err := db.PingContext(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := ApplyMigrations(ctx, db.DB); err != nil {
 		t.Fatal(err)
 	}
 	repo := NewRepository(db)
