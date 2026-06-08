@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"github.com/shopspring/decimal"
 
@@ -699,7 +699,15 @@ func (r *Repository) insertSystemStateHistory(ctx context.Context, state domain.
 	_, err := r.execer().ExecContext(ctx, `
 INSERT INTO system_state_history (ts, state, mode, halted, halt_reason, context_json)
 VALUES (UTC_TIMESTAMP(3), ?, ?, ?, ?, ?)`, state, mode, halted, nullableString(reason), contextJSON)
+	if isMissingTableError(err) {
+		return nil
+	}
 	return err
+}
+
+func isMissingTableError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1146
 }
 
 func (r *Repository) Unhalt(ctx context.Context, reason string) error {
