@@ -616,6 +616,23 @@ func (r *Repository) SaveSystemState(ctx context.Context, state domain.SystemSta
 INSERT INTO system_state (id, state, mode, halted, halt_reason, last_heartbeat, context_json)
 VALUES (1, ?, ?, ?, ?, UTC_TIMESTAMP(3), ?)
 ON DUPLICATE KEY UPDATE
+  state=IF(halted=1 AND VALUES(halted)=0, state, VALUES(state)),
+  mode=VALUES(mode),
+  halted=IF(halted=1 AND VALUES(halted)=0, halted, VALUES(halted)),
+  halt_reason=IF(halted=1 AND VALUES(halted)=0, halt_reason, VALUES(halt_reason)),
+  last_heartbeat=VALUES(last_heartbeat),
+  context_json=VALUES(context_json)`, state, mode, halted, nullableString(reason), contextJSON)
+	return err
+}
+
+func (r *Repository) forceSaveSystemState(ctx context.Context, state domain.SystemState, mode domain.Mode, halted bool, reason string, contextJSON string) error {
+	if contextJSON == "" {
+		contextJSON = "{}"
+	}
+	_, err := r.execer().ExecContext(ctx, `
+INSERT INTO system_state (id, state, mode, halted, halt_reason, last_heartbeat, context_json)
+VALUES (1, ?, ?, ?, ?, UTC_TIMESTAMP(3), ?)
+ON DUPLICATE KEY UPDATE
   state=VALUES(state), mode=VALUES(mode), halted=VALUES(halted),
   halt_reason=VALUES(halt_reason), last_heartbeat=VALUES(last_heartbeat),
   context_json=VALUES(context_json)`, state, mode, halted, nullableString(reason), contextJSON)
@@ -646,6 +663,9 @@ func (r *Repository) Unhalt(ctx context.Context, reason string) error {
 				return err
 			}
 			mode = currentMode
+		}
+		if txRepo, ok := repo.(*Repository); ok {
+			return txRepo.forceSaveSystemState(ctx, domain.StateInit, mode, false, "", `{"manual_unhalt":true}`)
 		}
 		return repo.SaveSystemState(ctx, domain.StateInit, mode, false, "", `{"manual_unhalt":true}`)
 	})

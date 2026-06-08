@@ -165,3 +165,50 @@ func TestMonitorUntilRepostsAndExpiresAtDeadline(t *testing.T) {
 		t.Fatalf("free order counter=%d, want 2", sent)
 	}
 }
+
+func TestMonitorOnceDoesNotRepostWhenCheckRejects(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:     "uid",
+		Lot:               1,
+		MinPriceIncrement: decimal.NewFromInt(1),
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	order, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 3, book, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order.CreatedAt = time.Now().UTC().Add(-time.Minute)
+	if err := repo.UpsertOrder(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.MonitorOnce(ctx, order, MonitorConfig{
+		Deadline:     time.Now().Add(time.Minute),
+		PollInterval: time.Millisecond,
+		MaxAttempts:  2,
+		RepostAfter:  time.Second,
+		Instrument:   instrument,
+		ImproveTicks: 1,
+		Quote: func(context.Context, string) (domain.OrderBook, error) {
+			book.ReceivedAt = time.Now().UTC()
+			return book, nil
+		},
+		RepostCheck: func(context.Context, domain.Order, domain.Instrument, domain.OrderBook) error {
+			return context.Canceled
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(gateway.Orders); got != 1 {
+		t.Fatalf("broker orders=%d, want no repost", got)
+	}
+}

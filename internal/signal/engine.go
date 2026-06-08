@@ -74,7 +74,7 @@ func (e Engine) Evaluate(c Candidate) domain.Signal {
 		"ticker":         c.Instrument.Ticker,
 		"fund_type":      c.Instrument.FundType,
 		"trading_status": c.TradingStatus,
-		"spread_limit":   e.spreadLimit(c.Instrument).String(),
+		"spread_limit":   e.SpreadLimit(c.Instrument).String(),
 	}
 	for k, v := range c.ExtraContext {
 		context[k] = v
@@ -122,7 +122,7 @@ func (e Engine) firstRejectReason(c Candidate) string {
 		return ReasonWinRate
 	case features.NetEdgeBps.LessThan(e.cfg.MinNetEdgeBps):
 		return ReasonNetEdge
-	case features.SpreadBps.GreaterThan(e.spreadLimit(instr)):
+	case features.SpreadBps.GreaterThan(e.SpreadLimit(instr)):
 		return ReasonSpread
 	case features.TickBps.GreaterThan(e.cfg.MaxTickBps):
 		return ReasonTick
@@ -137,7 +137,7 @@ func (e Engine) firstRejectReason(c Candidate) string {
 	}
 }
 
-func (e Engine) spreadLimit(instr domain.Instrument) decimal.Decimal {
+func (e Engine) SpreadLimit(instr domain.Instrument) decimal.Decimal {
 	fundType := strings.ToLower(instr.FundType)
 	switch {
 	case strings.Contains(fundType, "money"):

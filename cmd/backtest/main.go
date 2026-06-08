@@ -26,6 +26,8 @@ func run() error {
 	entrySlip := flag.String("entry-slippage-bps", "8", "entry slippage in bps")
 	exitSlip := flag.String("exit-slippage-bps", "8", "exit slippage in bps")
 	commission := flag.String("commission-roundtrip-bps", "0", "roundtrip commission in bps")
+	riskBuffer := flag.String("risk-buffer-bps", "5", "risk buffer in bps included in signal cost")
+	assumedSpread := flag.String("assumed-spread-bps", "20", "assumed executable spread cost in bps")
 	rollingShort := flag.Int("rolling-short", 60, "short rolling window")
 	rollingLong := flag.Int("rolling-long", 252, "long rolling window")
 	ewmaLambda := flag.Float64("ewma-lambda", 0.08, "EWMA lambda")
@@ -80,6 +82,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("commission: %w", err)
 	}
+	riskBuf, err := decimal.NewFromString(*riskBuffer)
+	if err != nil {
+		return fmt.Errorf("risk buffer: %w", err)
+	}
+	assumed, err := decimal.NewFromString(*assumedSpread)
+	if err != nil {
+		return fmt.Errorf("assumed spread: %w", err)
+	}
 	tstat, err := decimal.NewFromString(*minTStat)
 	if err != nil {
 		return fmt.Errorf("min tstat: %w", err)
@@ -108,6 +118,7 @@ func run() error {
 		EntrySlippageBps:       entry,
 		ExitSlippageBps:        exit,
 		CommissionRoundtripBps: comm,
+		RiskBufferBps:          riskBuf,
 		OutputDir:              *outputDir,
 		RollingShort:           *rollingShort,
 		RollingLong:            *rollingLong,
@@ -118,6 +129,7 @@ func run() error {
 		MinADVRUB:              adv,
 		MaxSpreadBps:           spread,
 		MaxTickBps:             tick,
+		AssumedSpreadBps:       assumed,
 		RequireZeroCommission:  *requireZeroCommission,
 		UseMinuteModel:         *useMinuteModel,
 	})

@@ -48,6 +48,7 @@ type Config struct {
 	ExitWindowStart        timeutil.TimeOfDay
 	ExitWindowEnd          timeutil.TimeOfDay
 	HardExitDeadline       timeutil.TimeOfDay
+	MarketClose            timeutil.TimeOfDay
 	QuoteDepth             int32
 	MaxQuoteAge            time.Duration
 	OrderPollInterval      time.Duration
@@ -60,6 +61,7 @@ type Config struct {
 	RequireZeroCommission  bool
 	QuarantineOnNonZero    bool
 	ReconciliationInterval time.Duration
+	MaxOpenPositions       int
 }
 
 type Services struct {
@@ -89,6 +91,13 @@ type Scheduler struct {
 
 	infraFailedSince time.Time
 	lastReconciledAt time.Time
+}
+
+type signalCandidate struct {
+	Signal     domain.Signal
+	Instrument domain.Instrument
+	Feature    domain.FeatureSet
+	Book       domain.OrderBook
 }
 
 func New(clock timeutil.Clock, sm statemachine.System, cfg Config, svc Services) Scheduler {
@@ -205,22 +214,39 @@ func (s *Scheduler) prepareSignals(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	instrumentByUID := make(map[string]domain.Instrument, len(instrumentsList))
 	for _, instrument := range instrumentsList {
-		if err := s.generateInstrumentSignal(ctx, now, tradeDate, portfolio, len(openPositions), instrument); err != nil {
+		instrumentByUID[instrument.InstrumentUID] = instrument
+	}
+	existingExposure := positionsExposure(openPositions, instrumentByUID, portfolio)
+	generated := make([]signalCandidate, 0, len(instrumentsList))
+	for _, instrument := range instrumentsList {
+		candidate, err := s.generateInstrumentSignal(ctx, tradeDate, len(openPositions), instrument)
+		if err != nil {
+			return err
+		}
+		generated = append(generated, candidate)
+	}
+	s.applyBatchSignalLimits(portfolio, existingExposure, len(openPositions), generated)
+	for _, candidate := range generated {
+		if err := s.svc.Repo.UpsertSignal(ctx, candidate.Signal); err != nil {
+			return err
+		}
+		if err := s.notifySignal(ctx, now, candidate.Signal); err != nil {
 			return err
 		}
 	}
 	return s.transitionTo(ctx, domain.StateWaitEntryWindow)
 }
 
-func (s Scheduler) generateInstrumentSignal(ctx context.Context, now, tradeDate time.Time, portfolio domain.Portfolio, openPositionCount int, instrument domain.Instrument) error {
+func (s Scheduler) generateInstrumentSignal(ctx context.Context, tradeDate time.Time, openPositionCount int, instrument domain.Instrument) (signalCandidate, error) {
 	book, err := s.svc.MarketData.LatestQuote(ctx, instrument.InstrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
 	if err != nil {
-		return s.saveRejectedSignal(ctx, tradeDate, instrument, "quote_unavailable", err)
+		return s.rejectedSignal(tradeDate, instrument, "quote_unavailable", err), nil
 	}
 	spread, err := spreadFromBook(book, instrument.MinPriceIncrement)
 	if err != nil {
-		return s.saveRejectedSignal(ctx, tradeDate, instrument, "spread_unavailable", err)
+		return s.rejectedSignal(tradeDate, instrument, "spread_unavailable", err), nil
 	}
 	tradingStatus, err := s.svc.Gateway.GetTradingStatus(ctx, instrument.InstrumentUID)
 	if err != nil {
@@ -228,7 +254,7 @@ func (s Scheduler) generateInstrumentSignal(ctx context.Context, now, tradeDate 
 	}
 	feature, err := s.svc.Features.Recompute(ctx, instrument, tradeDate, spread)
 	if err != nil {
-		return s.saveRejectedSignal(ctx, tradeDate, instrument, "features_unavailable", err)
+		return s.rejectedSignal(tradeDate, instrument, "features_unavailable", err), nil
 	}
 	remaining, err := s.svc.FreeOrders.Check(ctx, tradeDate, instrument, s.maxOrderAttemptsPerTrade())
 	freeOrderOK := err == nil
@@ -245,30 +271,10 @@ func (s Scheduler) generateInstrumentSignal(ctx context.Context, now, tradeDate 
 			"spread_bps":            spread.SpreadBps.String(),
 		},
 	})
-	if sig.Decision == domain.DecisionEnter {
-		sized, sizingErr := s.sizeSignal(ctx, portfolio, instrument, feature, book, 1)
-		switch {
-		case sizingErr != nil:
-			sig.Decision = domain.DecisionReject
-			sig.RejectReason = sizingErr.Error()
-		case sized.Lots <= 0:
-			sig.Decision = domain.DecisionReject
-			if isSizingSkipReason(sized.Reason) {
-				sig.Decision = domain.DecisionSkip
-			}
-			sig.RejectReason = sized.Reason
-		default:
-			sig.TargetLots = sized.Lots
-			sig.TargetNotional = sized.TargetNotional
-		}
-	}
-	if err := s.svc.Repo.UpsertSignal(ctx, sig); err != nil {
-		return err
-	}
-	return s.notifySignal(ctx, now, sig)
+	return signalCandidate{Signal: sig, Instrument: instrument, Feature: feature, Book: book}, nil
 }
 
-func (s Scheduler) saveRejectedSignal(ctx context.Context, tradeDate time.Time, instrument domain.Instrument, reason string, cause error) error {
+func (s Scheduler) rejectedSignal(tradeDate time.Time, instrument domain.Instrument, reason string, cause error) signalCandidate {
 	sig := domain.Signal{
 		TradeDate:     tradeDate,
 		InstrumentUID: instrument.InstrumentUID,
@@ -277,10 +283,63 @@ func (s Scheduler) saveRejectedSignal(ctx context.Context, tradeDate time.Time, 
 		ContextJSON:   fmt.Sprintf(`{"error":%q}`, cause.Error()),
 		CreatedAt:     s.nowUTC(),
 	}
-	return s.svc.Repo.UpsertSignal(ctx, sig)
+	return signalCandidate{Signal: sig, Instrument: instrument}
 }
 
-func (s Scheduler) sizeSignal(_ context.Context, portfolio domain.Portfolio, instrument domain.Instrument, feature domain.FeatureSet, book domain.OrderBook, selected int) (risk.SizingResult, error) {
+func (s Scheduler) applyBatchSignalLimits(portfolio domain.Portfolio, existingExposure decimal.Decimal, openPositionCount int, generated []signalCandidate) {
+	enterIndexes := make([]int, 0, len(generated))
+	for i := range generated {
+		if generated[i].Signal.Decision == domain.DecisionEnter {
+			enterIndexes = append(enterIndexes, i)
+		}
+	}
+	sort.SliceStable(enterIndexes, func(i, j int) bool {
+		left := generated[enterIndexes[i]].Signal
+		right := generated[enterIndexes[j]].Signal
+		if left.Score.Equal(right.Score) {
+			return left.InstrumentUID < right.InstrumentUID
+		}
+		return left.Score.GreaterThan(right.Score)
+	})
+	remainingSlots := len(enterIndexes)
+	if s.cfg.MaxOpenPositions > 0 {
+		remainingSlots = s.cfg.MaxOpenPositions - openPositionCount
+		if remainingSlots < 0 {
+			remainingSlots = 0
+		}
+		if remainingSlots > len(enterIndexes) {
+			remainingSlots = len(enterIndexes)
+		}
+	}
+	selectedCount := remainingSlots
+	for rank, index := range enterIndexes {
+		candidate := &generated[index]
+		if rank >= remainingSlots {
+			candidate.Signal.Decision = domain.DecisionSkip
+			candidate.Signal.TargetLots = 0
+			candidate.Signal.TargetNotional = decimal.Zero
+			candidate.Signal.RejectReason = signal.ReasonMaxPositions
+			continue
+		}
+		sized, sizingErr := s.sizeSignal(portfolio, candidate.Instrument, candidate.Feature, candidate.Book, selectedCount, existingExposure, decimal.Zero)
+		switch {
+		case sizingErr != nil:
+			candidate.Signal.Decision = domain.DecisionReject
+			candidate.Signal.RejectReason = sizingErr.Error()
+		case sized.Lots <= 0:
+			candidate.Signal.Decision = domain.DecisionReject
+			if isSizingSkipReason(sized.Reason) {
+				candidate.Signal.Decision = domain.DecisionSkip
+			}
+			candidate.Signal.RejectReason = sized.Reason
+		default:
+			candidate.Signal.TargetLots = sized.Lots
+			candidate.Signal.TargetNotional = sized.TargetNotional
+		}
+	}
+}
+
+func (s Scheduler) sizeSignal(portfolio domain.Portfolio, instrument domain.Instrument, feature domain.FeatureSet, book domain.OrderBook, selected int, existingExposure, reservedCash decimal.Decimal) (risk.SizingResult, error) {
 	bid, ask, err := bestBidAsk(book)
 	if err != nil {
 		return risk.SizingResult{}, err
@@ -292,6 +351,8 @@ func (s Scheduler) sizeSignal(_ context.Context, portfolio domain.Portfolio, ins
 	return s.svc.Sizer.Size(risk.SizingInput{
 		Portfolio:           portfolio,
 		SelectedInstruments: selected,
+		ExistingExposure:    existingExposure,
+		ReservedCash:        reservedCash,
 		LimitPrice:          price,
 		Lot:                 instrument.Lot,
 		EntryIntervalVolume: feature.EntryIntervalVolume,
@@ -313,6 +374,7 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	sortSignalsForEntry(signals)
 	existing, err := s.svc.Repo.ListOrders(ctx, s.svc.AccountIDHash, tradeDate, tradeDate)
 	if err != nil {
 		return err
@@ -325,8 +387,24 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	portfolio, err := s.svc.Gateway.GetPortfolio(ctx, s.svc.AccountID)
+	if err != nil {
+		return err
+	}
+	baseExposure := positionsExposure(openPositions, instrumentByUID, portfolio)
+	pendingExposure := ordersExposure(existing, instrumentByUID, domain.SideBuy, true)
+	reservedCash := pendingExposure
+	projectedOpenPositions := len(openPositions) + countActiveOrders(existing, domain.SideBuy, tradeDate)
+	entryCandidates := entryOrderCandidates(signals, existing)
 	for _, sig := range signals {
 		if sig.Decision != domain.DecisionEnter || sig.TargetLots <= 0 || hasOrder(existing, sig.InstrumentUID, domain.SideBuy) {
+			continue
+		}
+		remainingSelections := remainingSignalCount(entryCandidates, sig.InstrumentUID)
+		if s.cfg.MaxOpenPositions > 0 && projectedOpenPositions >= s.cfg.MaxOpenPositions {
+			if err := s.recordPreTradeReject(ctx, sig.InstrumentUID, signal.ReasonMaxPositions, `{"reason":"max_positions_reached"}`); err != nil {
+				return err
+			}
 			continue
 		}
 		instrument, ok := instrumentByUID[sig.InstrumentUID]
@@ -352,37 +430,55 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return err
 		}
+		if err := s.checkSpreadBeforeOrder(ctx, instrument, book); err != nil {
+			if insertErr := s.recordPreTradeReject(ctx, sig.InstrumentUID, err.Error(), `{"reason":"spread_limit"}`); insertErr != nil {
+				return insertErr
+			}
+			continue
+		}
 		tradingStatus, err := s.svc.Gateway.GetTradingStatus(ctx, sig.InstrumentUID)
 		if err != nil {
 			tradingStatus = domain.TradingStatusUnknown
 		}
-		portfolio, err := s.svc.Gateway.GetPortfolio(ctx, s.svc.AccountID)
+		portfolio, err = s.svc.Gateway.GetPortfolio(ctx, s.svc.AccountID)
 		if err != nil {
 			return err
 		}
-		pre := s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
-			Portfolio:       portfolio,
-			OpenPositions:   len(openPositions),
-			TradingStatus:   tradingStatus,
-			QuoteReceivedAt: book.ReceivedAt,
-			Now:             now.UTC(),
-			MarketClose:     s.cfg.EntryWindowEnd.On(now, s.cfg.Location).UTC(),
-		})
-		if !pre.Allowed {
-			if err := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
-				Severity:      domain.SeverityWarn,
-				EventType:     "pre_trade_reject",
-				InstrumentUID: sig.InstrumentUID,
-				Message:       pre.Reason,
-				ContextJSON:   "{}",
-			}); err != nil {
+		feature, err := s.svc.Repo.GetFeature(ctx, sig.InstrumentUID, tradeDate)
+		if err != nil {
+			return err
+		}
+		sized, err := s.sizeSignal(portfolio, instrument, feature, book, remainingSelections, baseExposure.Add(pendingExposure), reservedCash)
+		if err != nil {
+			return err
+		}
+		lots := min(sig.TargetLots, sized.Lots)
+		if lots <= 0 {
+			reason := sized.Reason
+			if reason == "" {
+				reason = risk.ErrNoSizingCapacity.Error()
+			}
+			if err := s.recordPreTradeReject(ctx, sig.InstrumentUID, reason, `{"reason":"sizing"}`); err != nil {
 				return err
 			}
 			continue
 		}
-		placed, err := s.svc.Execution.PlaceEntry(ctx, s.svc.AccountIDHash, instrument, tradeDate, sig.TargetLots, book, s.cfg.PassiveImproveTicks, 1)
+		pre, err := s.preTradeCheck(ctx, now, portfolio, projectedOpenPositions, tradingStatus, book.ReceivedAt)
+		if err != nil {
+			return err
+		}
+		if !pre.Allowed {
+			if err := s.recordPreTradeReject(ctx, sig.InstrumentUID, pre.Reason, "{}"); err != nil {
+				return err
+			}
+			continue
+		}
+		placed, err := s.svc.Execution.PlaceEntry(ctx, s.svc.AccountIDHash, instrument, tradeDate, lots, book, s.cfg.PassiveImproveTicks, 1)
 		if err != nil && !errors.Is(err, execution.ErrBrokerOrdersDisabled) {
 			return err
+		}
+		if errors.Is(err, execution.ErrBrokerOrdersDisabled) {
+			continue
 		}
 		_ = s.svc.Notifier.Info(ctx, fmt.Sprintf("entry order %s %s lots=%d status=%s", instrument.Ticker, placed.Side, placed.QuantityLots, placed.Status))
 		if placed.FilledLots > 0 {
@@ -391,6 +487,10 @@ func (s *Scheduler) placeEntryOrders(ctx context.Context, now time.Time) error {
 			}
 		}
 		existing = append(existing, placed)
+		notional := orderNotional(placed, instrument)
+		pendingExposure = pendingExposure.Add(notional)
+		reservedCash = reservedCash.Add(notional)
+		projectedOpenPositions++
 	}
 	return s.transitionTo(ctx, domain.StateMonitorEntryOrders)
 }
@@ -411,15 +511,16 @@ func (s *Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error
 	if !s.nowUTC().Before(deadline) {
 		return s.closeEntryWindow(ctx)
 	}
+	tradeDate := tradingDate(now)
 	for _, order := range orders {
-		if order.Side != domain.SideBuy || order.BrokerOrderID == "" {
+		if order.Side != domain.SideBuy || order.BrokerOrderID == "" || !sameTradingDate(order.TradeDate, tradeDate) {
 			continue
 		}
 		instrument, ok := instrumentByUID[order.InstrumentUID]
 		if !ok {
 			return fmt.Errorf("instrument %s is not in registry", order.InstrumentUID)
 		}
-		monitored, err := s.svc.Execution.MonitorUntil(ctx, order, execution.MonitorConfig{
+		monitored, err := s.svc.Execution.MonitorOnce(ctx, order, execution.MonitorConfig{
 			Deadline:     deadline,
 			PollInterval: s.cfg.OrderPollInterval,
 			MaxAttempts:  s.cfg.MaxEntryOrderAttempts,
@@ -428,6 +529,9 @@ func (s *Scheduler) monitorEntryOrders(ctx context.Context, now time.Time) error
 			ImproveTicks: s.cfg.PassiveImproveTicks,
 			Quote: func(ctx context.Context, instrumentUID string) (domain.OrderBook, error) {
 				return s.svc.MarketData.LatestQuote(ctx, instrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
+			},
+			RepostCheck: func(ctx context.Context, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error {
+				return s.repostPreTradeCheck(ctx, now, order, instrument, book)
 			},
 		})
 		if err != nil {
@@ -460,11 +564,12 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 	if err := s.transitionTo(ctx, domain.StatePlaceExitOrders); err != nil {
 		return err
 	}
+	exitTradeDate := tradingDate(now)
 	positionsList, err := s.svc.Repo.ListOpenPositions(ctx, s.svc.AccountIDHash)
 	if err != nil {
 		return err
 	}
-	existing, err := s.svc.Repo.ListOrders(ctx, s.svc.AccountIDHash, tradingDate(now).AddDate(0, 0, -1), tradingDate(now))
+	existing, err := s.svc.Repo.ListOrders(ctx, s.svc.AccountIDHash, exitTradeDate.AddDate(0, 0, -1), exitTradeDate)
 	if err != nil {
 		return err
 	}
@@ -480,9 +585,21 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		if !ok {
 			return fmt.Errorf("instrument %s is not in registry", pos.InstrumentUID)
 		}
+		if _, err := s.svc.FreeOrders.Check(ctx, exitTradeDate, instrument, s.cfg.MaxExitOrderAttempts); err != nil {
+			if insertErr := s.recordPreTradeReject(ctx, pos.InstrumentUID, err.Error(), `{"reason":"free_order_budget_insufficient"}`); insertErr != nil {
+				return insertErr
+			}
+			continue
+		}
 		book, err := s.svc.MarketData.LatestQuote(ctx, pos.InstrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
 		if err != nil {
 			return err
+		}
+		if err := s.checkSpreadBeforeOrder(ctx, instrument, book); err != nil {
+			if insertErr := s.recordPreTradeReject(ctx, pos.InstrumentUID, err.Error(), `{"reason":"spread_limit"}`); insertErr != nil {
+				return insertErr
+			}
+			continue
 		}
 		tradingStatus, err := s.svc.Gateway.GetTradingStatus(ctx, pos.InstrumentUID)
 		if err != nil {
@@ -492,20 +609,19 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return err
 		}
-		pre := s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
-			Portfolio:       portfolio,
-			OpenPositions:   len(positionsList),
-			TradingStatus:   tradingStatus,
-			QuoteReceivedAt: book.ReceivedAt,
-			Now:             now.UTC(),
-			MarketClose:     s.cfg.HardExitDeadline.On(now, s.cfg.Location).UTC(),
-		})
+		pre, err := s.preTradeCheck(ctx, now, portfolio, len(positionsList), tradingStatus, book.ReceivedAt)
+		if err != nil {
+			return err
+		}
 		if !pre.Allowed {
 			return fmt.Errorf("exit pre-trade rejected: %s", pre.Reason)
 		}
-		placed, err := s.svc.Execution.PlaceExit(ctx, s.svc.AccountIDHash, instrument, pos.OpenTradeDate, pos.Lots, book, s.cfg.PassiveImproveTicks, 1)
+		placed, err := s.svc.Execution.PlaceExit(ctx, s.svc.AccountIDHash, instrument, exitTradeDate, pos.Lots, book, s.cfg.PassiveImproveTicks, 1)
 		if err != nil && !errors.Is(err, execution.ErrBrokerOrdersDisabled) {
 			return err
+		}
+		if errors.Is(err, execution.ErrBrokerOrdersDisabled) {
+			continue
 		}
 		if placed.FilledLots > 0 || placed.Commission.IsPositive() {
 			if err := s.recordExitFill(ctx, pos, placed); err != nil {
@@ -545,15 +661,16 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 		return err
 	}
 	deadline := s.cfg.HardExitDeadline.On(now, s.cfg.Location).UTC()
+	exitTradeDate := tradingDate(now)
 	for _, order := range orders {
-		if order.Side != domain.SideSell || order.BrokerOrderID == "" {
+		if order.Side != domain.SideSell || order.BrokerOrderID == "" || !sameTradingDate(order.TradeDate, exitTradeDate) {
 			continue
 		}
 		instrument, ok := instrumentByUID[order.InstrumentUID]
 		if !ok {
 			return fmt.Errorf("instrument %s is not in registry", order.InstrumentUID)
 		}
-		monitored, err := s.svc.Execution.MonitorUntil(ctx, order, execution.MonitorConfig{
+		monitored, err := s.svc.Execution.MonitorOnce(ctx, order, execution.MonitorConfig{
 			Deadline:     deadline,
 			PollInterval: s.cfg.OrderPollInterval,
 			MaxAttempts:  s.cfg.MaxExitOrderAttempts,
@@ -562,6 +679,9 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 			ImproveTicks: s.cfg.PassiveImproveTicks,
 			Quote: func(ctx context.Context, instrumentUID string) (domain.OrderBook, error) {
 				return s.svc.MarketData.LatestQuote(ctx, instrumentUID, s.cfg.QuoteDepth, s.cfg.MaxQuoteAge)
+			},
+			RepostCheck: func(ctx context.Context, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error {
+				return s.repostPreTradeCheck(ctx, now, order, instrument, book)
 			},
 		})
 		if err != nil {
@@ -740,21 +860,32 @@ func (s *Scheduler) checkInfrastructure(ctx context.Context) error {
 			s.infraFailedSince = time.Time{}
 			return nil
 		}
-		return s.recordInfrastructureFailure(fmt.Errorf("server_time_unavailable: %w", err))
+		return s.recordInfrastructureFailure(ctx, fmt.Errorf("server_time_unavailable: %w", err))
 	}
 	drift := timeutil.Drift(s.nowUTC(), serverTime)
 	if drift > s.cfg.MaxClockDrift {
-		return s.recordInfrastructureFailure(fmt.Errorf("server_clock_drift_too_high: %s > %s", drift, s.cfg.MaxClockDrift))
+		return s.recordInfrastructureFailure(ctx, fmt.Errorf("server_clock_drift_too_high: %s > %s", drift, s.cfg.MaxClockDrift))
 	}
 	s.infraFailedSince = time.Time{}
 	return nil
 }
 
-func (s *Scheduler) recordInfrastructureFailure(err error) error {
+func (s *Scheduler) recordInfrastructureFailure(ctx context.Context, err error) error {
 	now := s.nowUTC()
 	if s.infraFailedSince.IsZero() {
 		s.infraFailedSince = now
 		s.logWarn("infrastructure check failed; waiting for outage threshold", "err", err, "threshold", s.cfg.APIOutageHalt)
+		if s.svc.Repo != nil {
+			if insertErr := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+				TS:          now,
+				Severity:    domain.SeverityWarn,
+				EventType:   "infrastructure_outage_started",
+				Message:     err.Error(),
+				ContextJSON: fmt.Sprintf(`{"threshold_sec":%d}`, int(s.cfg.APIOutageHalt.Seconds())),
+			}); insertErr != nil {
+				return insertErr
+			}
+		}
 		return nil
 	}
 	if s.cfg.APIOutageHalt <= 0 || now.Sub(s.infraFailedSince) >= s.cfg.APIOutageHalt {
@@ -921,6 +1052,183 @@ func (s *Scheduler) failOpenPositionsAtHardDeadline(ctx context.Context) error {
 	return s.svc.Risk.Halt(ctx, s.cfg.Mode, "hard_exit_deadline_missed", fmt.Sprintf("%d positions remain open after hard deadline", len(failed)), "")
 }
 
+func (s Scheduler) checkSpreadBeforeOrder(_ context.Context, instrument domain.Instrument, book domain.OrderBook) error {
+	spread, err := spreadFromBook(book, instrument.MinPriceIncrement)
+	if err != nil {
+		return err
+	}
+	limit := s.svc.Signals.SpreadLimit(instrument)
+	if limit.IsPositive() && spread.SpreadBps.GreaterThan(limit) {
+		return fmt.Errorf("%s: spread_bps=%s max_spread_bps=%s", signal.ReasonSpread, spread.SpreadBps.String(), limit.String())
+	}
+	return nil
+}
+
+func (s Scheduler) repostPreTradeCheck(ctx context.Context, now time.Time, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error {
+	if err := s.checkSpreadBeforeOrder(ctx, instrument, book); err != nil {
+		_ = s.recordPreTradeReject(ctx, order.InstrumentUID, err.Error(), `{"reason":"spread_limit","stage":"repost"}`)
+		return err
+	}
+	tradingStatus, err := s.svc.Gateway.GetTradingStatus(ctx, order.InstrumentUID)
+	if err != nil {
+		tradingStatus = domain.TradingStatusUnknown
+	}
+	portfolio, err := s.svc.Gateway.GetPortfolio(ctx, s.svc.AccountID)
+	if err != nil {
+		return err
+	}
+	openPositions, err := s.svc.Repo.ListOpenPositions(ctx, s.svc.AccountIDHash)
+	if err != nil {
+		return err
+	}
+	pre, err := s.preTradeCheck(ctx, now, portfolio, len(openPositions), tradingStatus, book.ReceivedAt)
+	if err != nil {
+		return err
+	}
+	if !pre.Allowed {
+		_ = s.recordPreTradeReject(ctx, order.InstrumentUID, pre.Reason, `{"stage":"repost"}`)
+		return errors.New(pre.Reason)
+	}
+	return nil
+}
+
+func (s Scheduler) preTradeCheck(ctx context.Context, now time.Time, portfolio domain.Portfolio, openPositions int, tradingStatus domain.TradingStatus, quoteReceivedAt time.Time) (risk.PreTradeResult, error) {
+	metrics, err := s.riskMetrics(ctx, now, portfolio)
+	if err != nil {
+		return risk.PreTradeResult{}, err
+	}
+	return s.svc.Risk.PreTradeCheck(risk.PreTradeInput{
+		Portfolio:          portfolio,
+		OpenPositions:      openPositions,
+		DailyPnL:           metrics.dailyPnL,
+		WeeklyPnL:          metrics.weeklyPnL,
+		MonthlyDrawdownPct: metrics.monthlyDrawdownPct,
+		AvgSlippageBps10:   metrics.avgSlippageBps10,
+		TradingStatus:      tradingStatus,
+		QuoteReceivedAt:    quoteReceivedAt,
+		Now:                now.UTC(),
+		MarketClose:        s.marketCloseOn(now),
+	}), nil
+}
+
+type preTradeMetrics struct {
+	dailyPnL           decimal.Decimal
+	weeklyPnL          decimal.Decimal
+	monthlyDrawdownPct decimal.Decimal
+	avgSlippageBps10   decimal.Decimal
+}
+
+func (s Scheduler) riskMetrics(ctx context.Context, now time.Time, portfolio domain.Portfolio) (preTradeMetrics, error) {
+	today := tradingDate(now)
+	monthStart := today.AddDate(0, -1, 0)
+	positionsList, err := s.svc.Repo.ListPositions(ctx, s.svc.AccountIDHash, monthStart.AddDate(0, 0, -7), today)
+	if err != nil {
+		return preTradeMetrics{}, err
+	}
+	weekStart := today.AddDate(0, 0, -6)
+	var metrics preTradeMetrics
+	monthlyPnL := decimal.Zero
+	var closed []domain.Position
+	for _, pos := range positionsList {
+		if pos.Status != domain.PositionExitFilled {
+			continue
+		}
+		closedAt := positionCloseTime(pos)
+		if closedAt.IsZero() {
+			continue
+		}
+		closeDate := tradingDate(closedAt)
+		if closeDate.Equal(today) {
+			metrics.dailyPnL = metrics.dailyPnL.Add(pos.NetPnL)
+		}
+		if !closeDate.Before(weekStart) {
+			metrics.weeklyPnL = metrics.weeklyPnL.Add(pos.NetPnL)
+		}
+		if !closeDate.Before(monthStart) {
+			monthlyPnL = monthlyPnL.Add(pos.NetPnL)
+		}
+		closed = append(closed, pos)
+	}
+	if monthlyPnL.IsNegative() && portfolio.Equity.IsPositive() {
+		metrics.monthlyDrawdownPct = monthlyPnL.Neg().Div(portfolio.Equity)
+	}
+	avg, err := s.averageAdverseSlippageBps(ctx, closed, 10)
+	if err != nil {
+		return preTradeMetrics{}, err
+	}
+	metrics.avgSlippageBps10 = avg
+	return metrics, nil
+}
+
+func (s Scheduler) averageAdverseSlippageBps(ctx context.Context, positionsList []domain.Position, limit int) (decimal.Decimal, error) {
+	if limit <= 0 {
+		return decimal.Zero, nil
+	}
+	sort.Slice(positionsList, func(i, j int) bool {
+		return positionCloseTime(positionsList[i]).After(positionCloseTime(positionsList[j]))
+	})
+	signalsByDate := make(map[string][]domain.Signal)
+	var values []decimal.Decimal
+	for _, pos := range positionsList {
+		key := tradingDate(pos.OpenTradeDate).Format("2006-01-02")
+		signals, ok := signalsByDate[key]
+		if !ok {
+			var err error
+			signals, err = s.svc.Repo.ListSignals(ctx, tradingDate(pos.OpenTradeDate))
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return decimal.Zero, err
+			}
+			signalsByDate[key] = signals
+		}
+		for _, sig := range signals {
+			if sig.InstrumentUID != pos.InstrumentUID || sig.Decision != domain.DecisionEnter {
+				continue
+			}
+			adverse := sig.NetEdgeBps.Sub(pos.RealizedEdgeBps)
+			if adverse.IsNegative() {
+				adverse = decimal.Zero
+			}
+			values = append(values, adverse)
+			break
+		}
+		if len(values) == limit {
+			break
+		}
+	}
+	if len(values) == 0 {
+		return decimal.Zero, nil
+	}
+	sum := decimal.Zero
+	for _, value := range values {
+		sum = sum.Add(value)
+	}
+	return sum.Div(decimal.NewFromInt(int64(len(values)))), nil
+}
+
+func positionCloseTime(pos domain.Position) time.Time {
+	if pos.ClosedAt != nil {
+		return pos.ClosedAt.UTC()
+	}
+	return pos.UpdatedAt.UTC()
+}
+
+func (s Scheduler) marketCloseOn(now time.Time) time.Time {
+	if s.cfg.MarketClose.Duration <= 0 {
+		return time.Time{}
+	}
+	return s.cfg.MarketClose.On(now, s.cfg.Location).UTC()
+}
+
+func (s Scheduler) recordPreTradeReject(ctx context.Context, instrumentUID, message, contextJSON string) error {
+	return s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
+		Severity:      domain.SeverityWarn,
+		EventType:     "pre_trade_reject",
+		InstrumentUID: instrumentUID,
+		Message:       message,
+		ContextJSON:   contextJSON,
+	})
+}
+
 func (s Scheduler) nowUTC() time.Time {
 	if s.clock != nil {
 		return s.clock.Now().UTC()
@@ -1060,6 +1368,120 @@ func hasOrder(orders []domain.Order, instrumentUID string, side domain.Side) boo
 		}
 	}
 	return false
+}
+
+func sortSignalsForEntry(signals []domain.Signal) {
+	sort.SliceStable(signals, func(i, j int) bool {
+		if signals[i].Decision != signals[j].Decision {
+			return signals[i].Decision == domain.DecisionEnter
+		}
+		if signals[i].Score.Equal(signals[j].Score) {
+			return signals[i].InstrumentUID < signals[j].InstrumentUID
+		}
+		return signals[i].Score.GreaterThan(signals[j].Score)
+	})
+}
+
+func entryOrderCandidates(signals []domain.Signal, existing []domain.Order) []string {
+	out := make([]string, 0, len(signals))
+	for _, sig := range signals {
+		if sig.Decision == domain.DecisionEnter && sig.TargetLots > 0 && !hasOrder(existing, sig.InstrumentUID, domain.SideBuy) {
+			out = append(out, sig.InstrumentUID)
+		}
+	}
+	return out
+}
+
+func remainingSignalCount(candidates []string, instrumentUID string) int {
+	for i, candidate := range candidates {
+		if candidate == instrumentUID {
+			return len(candidates) - i
+		}
+	}
+	return 1
+}
+
+func countActiveOrders(orders []domain.Order, side domain.Side, tradeDate time.Time) int {
+	count := 0
+	for _, order := range orders {
+		if order.Side == side && sameTradingDate(order.TradeDate, tradeDate) && isActiveOrder(order.Status) {
+			count++
+		}
+	}
+	return count
+}
+
+func ordersExposure(orders []domain.Order, instruments map[string]domain.Instrument, side domain.Side, activeOnly bool) decimal.Decimal {
+	total := decimal.Zero
+	for _, order := range orders {
+		if order.Side != side {
+			continue
+		}
+		if activeOnly && !isActiveOrder(order.Status) {
+			continue
+		}
+		instrument := instruments[order.InstrumentUID]
+		total = total.Add(orderRemainingNotional(order, instrument))
+	}
+	return total
+}
+
+func positionsExposure(positions []domain.Position, instruments map[string]domain.Instrument, portfolio domain.Portfolio) decimal.Decimal {
+	local := decimal.Zero
+	for _, pos := range positions {
+		instrument := instruments[pos.InstrumentUID]
+		lot := pos.Lot
+		if lot <= 0 {
+			lot = instrument.Lot
+		}
+		if lot <= 0 || !pos.AvgBuyPrice.IsPositive() || pos.Lots <= 0 {
+			continue
+		}
+		local = local.Add(pos.AvgBuyPrice.Mul(decimal.NewFromInt(pos.Lots)).Mul(decimal.NewFromInt(lot)))
+	}
+	return money.Max(local, portfolioExposure(portfolio))
+}
+
+func portfolioExposure(portfolio domain.Portfolio) decimal.Decimal {
+	total := decimal.Zero
+	for _, holding := range portfolio.Holdings {
+		if holding.MarketValue.IsPositive() {
+			total = total.Add(holding.MarketValue)
+		}
+	}
+	return total
+}
+
+func orderNotional(order domain.Order, instrument domain.Instrument) decimal.Decimal {
+	lot := instrument.Lot
+	if lot <= 0 {
+		lot = 1
+	}
+	lots := order.QuantityLots
+	if lots <= 0 {
+		lots = order.FilledLots
+	}
+	return order.LimitPrice.Mul(decimal.NewFromInt(lots)).Mul(decimal.NewFromInt(lot))
+}
+
+func orderRemainingNotional(order domain.Order, instrument domain.Instrument) decimal.Decimal {
+	remaining := order.QuantityLots - order.FilledLots
+	if remaining <= 0 {
+		return decimal.Zero
+	}
+	lot := instrument.Lot
+	if lot <= 0 {
+		lot = 1
+	}
+	return order.LimitPrice.Mul(decimal.NewFromInt(remaining)).Mul(decimal.NewFromInt(lot))
+}
+
+func isActiveOrder(status domain.OrderStatus) bool {
+	return status == domain.OrderStatusNew || status == domain.OrderStatusSent || status == domain.OrderStatusPartiallyFilled
+}
+
+func sameTradingDate(a, b time.Time) bool {
+	return tradingDate(a).Equal(tradingDate(b))
 }
 
 func sinceMidnight(t time.Time) time.Duration {

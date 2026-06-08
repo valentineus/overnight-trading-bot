@@ -5,6 +5,12 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/shopspring/decimal"
+
+	"overnight-trading-bot/internal/domain"
+	"overnight-trading-bot/internal/testutil"
+	"overnight-trading-bot/internal/tinvest"
 )
 
 func TestRunRequiresAppMode(t *testing.T) {
@@ -27,5 +33,33 @@ func TestRunBacktestModeWithoutDB(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "backtest") {
 		t.Fatalf("unexpected stdout: %s", stdout.String())
+	}
+}
+
+func TestSeedPaperGatewayMakesSeedInstrumentsDiscoverable(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	if err := repo.UpsertInstrument(ctx, domain.Instrument{
+		InstrumentUID:     "PENDING:TRUR",
+		Ticker:            "TRUR",
+		ClassCode:         "TQTF",
+		Name:              "TRUR",
+		Lot:               1,
+		MinPriceIncrement: decimal.RequireFromString("0.0001"),
+		Currency:          "RUB",
+		Enabled:           true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := tinvest.NewFakeGateway()
+	if err := seedPaperGateway(ctx, repo, gateway); err != nil {
+		t.Fatal(err)
+	}
+	instrument, err := gateway.GetInstrument(ctx, "TRUR", "TQTF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !instrument.MetadataValid() || strings.HasPrefix(instrument.InstrumentUID, "PENDING:") {
+		t.Fatalf("instrument was not made runnable for paper: %+v", instrument)
 	}
 }

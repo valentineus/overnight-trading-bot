@@ -22,6 +22,7 @@ type Config struct {
 	EntrySlippageBps       decimal.Decimal
 	ExitSlippageBps        decimal.Decimal
 	CommissionRoundtripBps decimal.Decimal
+	RiskBufferBps          decimal.Decimal
 	InitialEquity          decimal.Decimal
 	OutputDir              string
 	RollingShort           int
@@ -122,6 +123,15 @@ func (cfg Config) withDefaults() Config {
 	if cfg.MaxTickBps.IsZero() {
 		cfg.MaxTickBps = decimal.NewFromInt(10)
 	}
+	if cfg.RiskBufferBps.IsZero() {
+		cfg.RiskBufferBps = decimal.NewFromInt(5)
+	}
+	if cfg.AssumedSpreadBps.IsZero() {
+		cfg.AssumedSpreadBps = cfg.MaxSpreadBps
+	}
+	if cfg.AssumedTickBps.IsZero() {
+		cfg.AssumedTickBps = cfg.MaxTickBps
+	}
 	if !cfg.RequireZeroCommission && cfg.CommissionRoundtripBps.IsZero() {
 		cfg.RequireZeroCommission = true
 	}
@@ -169,7 +179,7 @@ func (e Engine) RunWithMinuteCandles(candlesByInstrument map[string][]domain.Can
 	tradingDateSet := make(map[string]struct{})
 	for instrumentUID, candles := range prepared {
 		for i := 1; i < len(candles); i++ {
-			if i >= e.cfg.RollingShort {
+			if i >= max(e.cfg.RollingShort, e.cfg.RollingLong) {
 				tradingDateSet[candles[i].TradeDate.Format("2006-01-02")] = struct{}{}
 			}
 			candidate, ok, err := e.evaluateCandidate(instrumentUID, candles, i)
@@ -366,7 +376,7 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 		returns = append(returns, rf)
 	}
 	short := features.Rolling(returns, e.cfg.RollingShort, e.cfg.EWMALambda)
-	long := features.Rolling(returns, min(e.cfg.RollingLong, len(returns)), e.cfg.EWMALambda)
+	long := features.Rolling(returns, e.cfg.RollingLong, e.cfg.EWMALambda)
 	if !short.Available || !long.Available || short.StdDev == 0 {
 		return candidate{}, false, nil
 	}
@@ -374,7 +384,8 @@ func (e Engine) evaluateCandidate(instrumentUID string, candles []domain.Candle,
 	cost := e.cfg.AssumedSpreadBps.
 		Add(e.cfg.EntrySlippageBps).
 		Add(e.cfg.ExitSlippageBps).
-		Add(e.cfg.CommissionRoundtripBps)
+		Add(e.cfg.CommissionRoundtripBps).
+		Add(e.cfg.RiskBufferBps)
 	netEdge := rawEdge.Sub(cost)
 	adv := features.ADV(history, e.cfg.Lot, 20)
 	switch {

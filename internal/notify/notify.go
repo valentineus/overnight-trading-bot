@@ -13,6 +13,8 @@ import (
 	"overnight-trading-bot/internal/domain"
 )
 
+const mustDeliverEnqueueTimeout = 2 * time.Second
+
 type Notifier interface {
 	Info(ctx context.Context, msg string) error
 	Warn(ctx context.Context, msg string) error
@@ -53,8 +55,9 @@ type Telegram struct {
 }
 
 type outbound struct {
-	level domain.Severity
-	text  string
+	level       domain.Severity
+	text        string
+	mustDeliver bool
 }
 
 func NewTelegram(cfg TelegramConfig, log *slog.Logger) (Notifier, error) {
@@ -119,13 +122,19 @@ func (t *Telegram) enqueue(ctx context.Context, level domain.Severity, msg strin
 }
 
 func (t *Telegram) enqueueText(ctx context.Context, level domain.Severity, text string, mustDeliver bool) error {
-	item := outbound{level: level, text: text}
+	item := outbound{level: level, text: text, mustDeliver: mustDeliver}
 	if mustDeliver {
+		timer := time.NewTimer(mustDeliverEnqueueTimeout)
+		defer timer.Stop()
 		select {
 		case t.queue <- item:
 			return nil
 		case <-ctx.Done():
+			t.auditNotificationFailure(context.Background(), item, "notification_context_cancelled", ctx.Err().Error())
 			return ctx.Err()
+		case <-timer.C:
+			t.auditNotificationFailure(ctx, item, "notification_undeliverable", "telegram queue full")
+			return nil
 		}
 	}
 	select {
@@ -168,8 +177,10 @@ func (t *Telegram) dispatch() {
 
 func (t *Telegram) send(item outbound) {
 	msg := tgbotapi.NewMessage(t.cfg.ChatID, item.text)
+	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if _, err := t.bot.Send(msg); err != nil {
+			lastErr = err
 			delay := telegramRetryDelay(err, attempt)
 			if t.log != nil {
 				t.log.Warn("telegram send failed", "attempt", attempt+1, "err", err, "retry_in", delay)
@@ -189,6 +200,32 @@ func (t *Telegram) send(item outbound) {
 			continue
 		}
 		return
+	}
+	if item.mustDeliver {
+		message := "telegram send failed"
+		if lastErr != nil {
+			message = lastErr.Error()
+		}
+		t.auditNotificationFailure(context.Background(), item, "notification_undeliverable", message)
+	}
+}
+
+func (t *Telegram) auditNotificationFailure(ctx context.Context, item outbound, eventType, message string) {
+	if t.cfg.AuditSink == nil {
+		return
+	}
+	severity := domain.SeverityWarn
+	if item.mustDeliver {
+		severity = domain.SeverityCritical
+	}
+	if err := t.cfg.AuditSink.InsertRiskEvent(ctx, domain.RiskEvent{
+		TS:          time.Now().UTC(),
+		Severity:    severity,
+		EventType:   eventType,
+		Message:     message,
+		ContextJSON: fmt.Sprintf(`{"level":%q}`, item.level),
+	}); err != nil && t.log != nil {
+		t.log.Warn("telegram audit fallback failed", "err", err)
 	}
 }
 

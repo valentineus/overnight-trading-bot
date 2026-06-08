@@ -29,6 +29,8 @@ type SizingConfig struct {
 type SizingInput struct {
 	Portfolio           domain.Portfolio
 	SelectedInstruments int
+	ExistingExposure    decimal.Decimal
+	ReservedCash        decimal.Decimal
 	LimitPrice          decimal.Decimal
 	Lot                 int64
 	EntryIntervalVolume decimal.Decimal
@@ -66,11 +68,19 @@ func (s Sizer) Size(input SizingInput) SizingResult {
 		input.SelectedInstruments = 1
 	}
 	capLimit := input.Portfolio.Equity.Mul(s.cfg.MaxPositionPct)
-	exposureLimit := input.Portfolio.Equity.Mul(s.cfg.MaxTotalExposurePct).
-		Div(decimal.NewFromInt(int64(input.SelectedInstruments)))
+	totalExposureLimit := input.Portfolio.Equity.Mul(s.cfg.MaxTotalExposurePct)
+	remainingExposure := totalExposureLimit.Sub(input.ExistingExposure)
+	if remainingExposure.IsNegative() {
+		remainingExposure = decimal.Zero
+	}
+	exposureLimit := remainingExposure.Div(decimal.NewFromInt(int64(input.SelectedInstruments)))
 	liquidityLimit := money.Min(input.EntryIntervalVolume, input.ExitIntervalVolume).
 		Mul(s.cfg.MaxParticipationRate)
-	cashLimit := input.Portfolio.Cash.Mul(s.cfg.CashUsageBuffer)
+	availableCash := input.Portfolio.Cash.Sub(input.ReservedCash)
+	if availableCash.IsNegative() {
+		availableCash = decimal.Zero
+	}
+	cashLimit := availableCash.Mul(s.cfg.CashUsageBuffer)
 	riskLimit := capLimit
 	if input.Q05OvernightAbs.IsPositive() {
 		riskBudget := input.Portfolio.Equity.Mul(s.cfg.RiskBudgetPerInstrumentPct)

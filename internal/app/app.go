@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/shopspring/decimal"
 
 	"overnight-trading-bot/internal/config"
 	"overnight-trading-bot/internal/domain"
@@ -138,6 +139,9 @@ func Run(ctx context.Context, opts Options) error {
 	if closer != nil {
 		defer closer()
 	}
+	if err := seedPaperGateway(ctx, repo, gateway); err != nil {
+		return err
+	}
 	notifier, err := notify.NewTelegram(notify.TelegramConfig{
 		BotToken:     cfg.Telegram.BotToken,
 		ChatID:       cfg.Telegram.ChatID,
@@ -161,7 +165,8 @@ func Run(ctx context.Context, opts Options) error {
 		WithCommissionPolicy(cfg.Commission.RequireZeroCommission, cfg.Commission.QuarantineOnNonZero, cfg.Risk.CommissionToleranceRUB)
 	sm := statemachine.New(repo, cfg.App.Mode)
 	if _, err := sm.Recover(ctx, recon); err != nil {
-		log.Warn("state recovery did not resume trading", "err", err)
+		_ = notifier.Alert(ctx, fmt.Sprintf("state recovery failed: %s", err))
+		return fmt.Errorf("state recovery: %w", err)
 	}
 	health := healthcheck.New(db.DB, gateway, time.Duration(cfg.Risk.MaxClockDriftSec)*time.Second)
 	health.Start(cfg.App.HealthcheckAddr)
@@ -270,6 +275,7 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 		ExitWindowStart:        cfg.Execution.ExitWindowStart,
 		ExitWindowEnd:          cfg.Execution.ExitWindowEnd,
 		HardExitDeadline:       cfg.Execution.HardExitDeadline,
+		MarketClose:            cfg.Execution.MarketClose,
 		QuoteDepth:             cfg.Execution.QuoteDepth,
 		MaxQuoteAge:            time.Duration(cfg.Execution.MaxQuoteAgeSec) * time.Second,
 		OrderPollInterval:      time.Duration(cfg.Execution.OrderPollIntervalMS) * time.Millisecond,
@@ -282,7 +288,21 @@ func buildScheduler(clock timeutil.Clock, sm statemachine.System, cfg config.Con
 		RequireZeroCommission:  cfg.Commission.RequireZeroCommission,
 		QuarantineOnNonZero:    cfg.Commission.QuarantineOnNonZero,
 		ReconciliationInterval: 5 * time.Minute,
+		MaxOpenPositions:       minPositive(cfg.Strategy.MaxPositions, cfg.Risk.MaxOpenPositions),
 	}, services)
+}
+
+func minPositive(a, b int) int {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 func openDB(ctx context.Context, cfg config.Config) (*sqlx.DB, error) {
@@ -338,6 +358,42 @@ func buildGateway(ctx context.Context, cfg config.Config, log *slog.Logger) (tin
 	default:
 		return tinvest.NewFakeGateway(), nil, nil
 	}
+}
+
+func seedPaperGateway(ctx context.Context, repo interface {
+	ListInstruments(context.Context, bool) ([]domain.Instrument, error)
+}, gateway tinvest.Gateway) error {
+	fake, ok := gateway.(*tinvest.FakeGateway)
+	if !ok {
+		return nil
+	}
+	instrumentsList, err := repo.ListInstruments(ctx, true)
+	if err != nil {
+		return err
+	}
+	for _, instrument := range instrumentsList {
+		remote := instrument
+		if remote.InstrumentUID == "" || strings.HasPrefix(remote.InstrumentUID, "PENDING:") {
+			remote.InstrumentUID = "paper-" + strings.ToUpper(remote.Ticker)
+		}
+		if remote.Figi == "" {
+			remote.Figi = remote.InstrumentUID
+		}
+		if remote.Lot <= 0 {
+			remote.Lot = 1
+		}
+		if !remote.MinPriceIncrement.IsPositive() {
+			remote.MinPriceIncrement = decimal.RequireFromString("0.01")
+		}
+		if remote.Currency == "" {
+			remote.Currency = "RUB"
+		}
+		remote.Enabled = true
+		remote.UpdatedAt = time.Now().UTC()
+		fake.Instruments[remote.InstrumentUID] = remote
+		fake.Statuses[remote.InstrumentUID] = domain.TradingStatusNormal
+	}
+	return nil
 }
 
 func accountHash(accountID string) string {

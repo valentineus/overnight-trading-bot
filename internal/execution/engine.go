@@ -40,6 +40,7 @@ type MonitorConfig struct {
 	Instrument   domain.Instrument
 	ImproveTicks int
 	Quote        func(ctx context.Context, instrumentUID string) (domain.OrderBook, error)
+	RepostCheck  func(ctx context.Context, order domain.Order, instrument domain.Instrument, book domain.OrderBook) error
 }
 
 func NewEngine(mode domain.Mode, accountID string, gateway Gateway, store repository.Repository) Engine {
@@ -105,6 +106,9 @@ func (e *Engine) PlaceExit(ctx context.Context, accountIDHash string, instrument
 }
 
 func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Order, error) {
+	lock := e.lockFor(order.InstrumentUID)
+	lock.Lock()
+	defer lock.Unlock()
 	if e.store != nil {
 		existing, err := e.findExisting(ctx, order)
 		if err != nil {
@@ -127,15 +131,25 @@ func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Ord
 	if e.gateway == nil {
 		return domain.Order{}, errors.New("gateway is nil")
 	}
-	lock := e.lockFor(order.InstrumentUID)
-	lock.Lock()
-	defer lock.Unlock()
 
+	now := time.Now().UTC()
+	draft := order
+	draft.Status = domain.OrderStatusSent
+	draft.CreatedAt = now
+	draft.UpdatedAt = now
+	if draft.RawStateJSON == "" {
+		draft.RawStateJSON = "{}"
+	}
+	if e.store != nil {
+		if err := e.store.UpsertOrder(ctx, draft); err != nil {
+			return domain.Order{}, fmt.Errorf("persist draft order: %w", err)
+		}
+	}
 	posted, err := e.gateway.PostLimitOrder(ctx, e.accountID, order.InstrumentUID, order.Side, order.QuantityLots, order.LimitPrice, order.ClientOrderID)
 	if err != nil {
-		order.Status = domain.OrderStatusFailed
+		draft.Status = domain.OrderStatusFailed
 		if e.store != nil {
-			_ = e.store.UpsertOrder(ctx, order)
+			_ = e.store.UpsertOrder(ctx, draft)
 		}
 		return domain.Order{}, err
 	}
@@ -148,7 +162,7 @@ func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Ord
 	posted.QuantityLots = order.QuantityLots
 	posted.AttemptNo = order.AttemptNo
 	posted.TradeDate = order.TradeDate
-	posted.CreatedAt = time.Now().UTC()
+	posted.CreatedAt = now
 	posted.UpdatedAt = posted.CreatedAt
 	if e.store != nil {
 		if err := e.store.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
@@ -191,9 +205,7 @@ func (e *Engine) findExisting(ctx context.Context, order domain.Order) (domain.O
 		return domain.Order{}, err
 	}
 	for _, existing := range orders {
-		if existing.ClientOrderID == order.ClientOrderID &&
-			existing.Status != domain.OrderStatusFailed &&
-			existing.Status != domain.OrderStatusRejected {
+		if existing.ClientOrderID == order.ClientOrderID {
 			return existing, nil
 		}
 	}
@@ -294,12 +306,14 @@ func (e *Engine) MonitorUntil(ctx context.Context, order domain.Order, cfg Monit
 			aggregate.FilledLots < aggregate.QuantityLots &&
 			cfg.Quote != nil
 		if shouldRepost {
-			next, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+			next, reposted, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
 			if err != nil {
 				return aggregate, err
 			}
-			current = next
-			seen[current.ClientOrderID] = current
+			if reposted {
+				current = next
+				seen[current.ClientOrderID] = current
+			}
 			lastPost = time.Now()
 			continue
 		}
@@ -311,30 +325,156 @@ func (e *Engine) MonitorUntil(ctx context.Context, order domain.Order, cfg Monit
 	}
 }
 
-func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConfig, remaining int64) (domain.Order, error) {
+func (e *Engine) MonitorOnce(ctx context.Context, order domain.Order, cfg MonitorConfig) (domain.Order, error) {
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 500 * time.Millisecond
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = 1
+	}
+	previous := order
+	refreshed, err := e.Refresh(ctx, order)
+	if err != nil {
+		return order, err
+	}
+	aggregate := mergeAggregateFill(order, previous, refreshed)
+	current := mergeOrderState(order, refreshed)
+	aggregate.Status = current.Status
+	aggregate.UpdatedAt = current.UpdatedAt
+	aggregate.RawStateJSON = current.RawStateJSON
+	if aggregate.FilledLots >= aggregate.QuantityLots {
+		aggregate.Status = domain.OrderStatusFilled
+		return aggregate, nil
+	}
+	if isTerminal(current.Status) {
+		return aggregate, nil
+	}
+	if !cfg.Deadline.IsZero() && !time.Now().Before(cfg.Deadline) {
+		if err := e.Cancel(ctx, current); err != nil {
+			return aggregate, err
+		}
+		aggregate.Status = domain.OrderStatusExpired
+		if e.store != nil {
+			if err := e.store.UpdateOrderStatus(ctx, current.ClientOrderID, aggregate.Status, current.FilledLots, current.RawStateJSON); err != nil {
+				return aggregate, err
+			}
+		}
+		return aggregate, nil
+	}
+	shouldRepost := cfg.RepostAfter > 0 &&
+		repostDue(current, cfg.RepostAfter) &&
+		current.AttemptNo < cfg.MaxAttempts &&
+		aggregate.FilledLots < aggregate.QuantityLots &&
+		cfg.Quote != nil
+	if shouldRepost {
+		next, reposted, err := e.repost(ctx, current, cfg, aggregate.QuantityLots-aggregate.FilledLots)
+		if err != nil {
+			return aggregate, err
+		}
+		if reposted {
+			aggregate.BrokerOrderID = next.BrokerOrderID
+			aggregate.ClientOrderID = next.ClientOrderID
+			aggregate.Status = next.Status
+			aggregate.RawStateJSON = next.RawStateJSON
+			aggregate.UpdatedAt = next.UpdatedAt
+		}
+	}
+	return aggregate, nil
+}
+
+func (e *Engine) repost(ctx context.Context, order domain.Order, cfg MonitorConfig, remaining int64) (domain.Order, bool, error) {
 	if err := e.ensureRepostBudget(ctx, order, cfg.Instrument); err != nil {
-		return domain.Order{}, err
+		return domain.Order{}, false, err
 	}
-	if err := e.Cancel(ctx, order); err != nil {
-		return domain.Order{}, err
-	}
-	if remaining <= 0 {
-		order.Status = domain.OrderStatusFilled
-		return order, nil
+	if !cfg.Deadline.IsZero() && !time.Now().Before(cfg.Deadline) {
+		return order, false, nil
 	}
 	book, err := cfg.Quote(ctx, order.InstrumentUID)
 	if err != nil {
-		return domain.Order{}, err
+		return domain.Order{}, false, err
+	}
+	if cfg.RepostCheck != nil {
+		if err := cfg.RepostCheck(ctx, order, cfg.Instrument, book); err != nil {
+			return order, false, nil
+		}
+	}
+	if err := e.Cancel(ctx, order); err != nil {
+		return domain.Order{}, false, err
+	}
+	cancelled, err := e.waitTerminal(ctx, order, cfg)
+	if err != nil {
+		return domain.Order{}, false, err
+	}
+	if remaining <= 0 {
+		cancelled.Status = domain.OrderStatusFilled
+		return cancelled, true, nil
+	}
+	if !cfg.Deadline.IsZero() && !time.Now().Before(cfg.Deadline) {
+		return cancelled, true, nil
+	}
+	book, err = cfg.Quote(ctx, order.InstrumentUID)
+	if err != nil {
+		return domain.Order{}, false, err
+	}
+	if cfg.RepostCheck != nil {
+		if err := cfg.RepostCheck(ctx, order, cfg.Instrument, book); err != nil {
+			return cancelled, true, nil
+		}
 	}
 	attempt := order.AttemptNo + 1
 	switch order.Side {
 	case domain.SideBuy:
-		return e.PlaceEntry(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
+		next, err := e.PlaceEntry(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
+		return next, true, err
 	case domain.SideSell:
-		return e.PlaceExit(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
+		next, err := e.PlaceExit(ctx, order.AccountIDHash, cfg.Instrument, order.TradeDate, remaining, book, cfg.ImproveTicks, attempt)
+		return next, true, err
 	default:
-		return domain.Order{}, fmt.Errorf("unsupported side %s", order.Side)
+		return domain.Order{}, false, fmt.Errorf("unsupported side %s", order.Side)
 	}
+}
+
+func (e *Engine) waitTerminal(ctx context.Context, order domain.Order, cfg MonitorConfig) (domain.Order, error) {
+	current := order
+	for {
+		refreshed, err := e.Refresh(ctx, current)
+		if err != nil {
+			return domain.Order{}, err
+		}
+		current = mergeOrderState(current, refreshed)
+		if isTerminal(current.Status) {
+			return current, nil
+		}
+		if !cfg.Deadline.IsZero() && !time.Now().Before(cfg.Deadline) {
+			return current, nil
+		}
+		timer := time.NewTimer(cfg.PollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return domain.Order{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func repostDue(order domain.Order, after time.Duration) bool {
+	if after <= 0 {
+		return false
+	}
+	basis := order.CreatedAt
+	if basis.IsZero() {
+		basis = order.UpdatedAt
+	}
+	if basis.IsZero() {
+		return true
+	}
+	return time.Since(basis) >= after
 }
 
 func (e *Engine) ensureRepostBudget(ctx context.Context, order domain.Order, instrument domain.Instrument) error {

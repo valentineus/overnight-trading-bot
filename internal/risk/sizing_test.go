@@ -170,3 +170,28 @@ func TestSizerAppliesSizeReductionFactor(t *testing.T) {
 		t.Fatalf("unexpected reduced sizing: %+v", got)
 	}
 }
+
+func TestSizerSubtractsExistingExposureAndReservedCash(t *testing.T) {
+	sizer := NewSizer(SizingConfig{
+		MaxPositionPct:             rd("1"),
+		MaxTotalExposurePct:        rd("0.50"),
+		MaxParticipationRate:       rd("1"),
+		CashUsageBuffer:            rd("1"),
+		RiskBudgetPerInstrumentPct: rd("1"),
+		MinOrderNotionalRUB:        rd("1"),
+	})
+	got := sizer.Size(SizingInput{
+		Portfolio:           domain.Portfolio{Equity: rd("100000"), Cash: rd("50000")},
+		SelectedInstruments: 2,
+		ExistingExposure:    rd("30000"),
+		ReservedCash:        rd("10000"),
+		LimitPrice:          rd("100"),
+		Lot:                 1,
+		EntryIntervalVolume: rd("1000000"),
+		ExitIntervalVolume:  rd("1000000"),
+		Q05OvernightAbs:     rd("1"),
+	})
+	if got.Lots != 100 || !got.TargetNotional.Equal(rd("10000")) {
+		t.Fatalf("unexpected sizing with reserved exposure: %+v", got)
+	}
+}

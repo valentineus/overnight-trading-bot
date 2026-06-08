@@ -88,6 +88,7 @@ type ExecutionConfig struct {
 	ExitWindowStart       timeutil.TimeOfDay `env:"EXIT_WINDOW_START" envDefault:"10:05:00"`
 	ExitWindowEnd         timeutil.TimeOfDay `env:"EXIT_WINDOW_END" envDefault:"10:25:00"`
 	HardExitDeadline      timeutil.TimeOfDay `env:"HARD_EXIT_DEADLINE" envDefault:"10:45:00"`
+	MarketClose           timeutil.TimeOfDay `env:"MARKET_CLOSE" envDefault:"18:50:00"`
 	MinTimeToCloseSec     int                `env:"MIN_TIME_TO_CLOSE_SEC" envDefault:"90"`
 	AllowMarketOrders     bool               `env:"ALLOW_MARKET_ORDERS" envDefault:"false"`
 	MaxEntryOrderAttempts int                `env:"MAX_ENTRY_ORDER_ATTEMPTS" envDefault:"3"`
@@ -236,6 +237,11 @@ func (c Config) validateWindows() error {
 		c.Execution.ExitWindowStart.Duration >= c.Execution.ExitWindowEnd.Duration ||
 		c.Execution.ExitWindowEnd.Duration > c.Execution.HardExitDeadline.Duration {
 		return errors.New("exit windows must be monotonic from EXEC_EXIT_WATCH_START to EXEC_HARD_EXIT_DEADLINE")
+	}
+	if c.Execution.MarketClose.Duration > 0 &&
+		(c.Execution.MarketClose.Duration <= c.Execution.NoNewEntryAfter.Duration ||
+			c.Execution.MarketClose.Duration <= c.Execution.HardExitDeadline.Duration) {
+		return errors.New("EXEC_MARKET_CLOSE must be after entry and exit trading windows")
 	}
 	return nil
 }

@@ -96,20 +96,20 @@ func legalTransition(from, to domain.SystemState) bool {
 		return true
 	}
 	allowed := map[domain.SystemState][]domain.SystemState{
-		domain.StateInit:               {domain.StateSyncInstruments, domain.StateWaitExitWindow},
+		domain.StateInit:               {domain.StateSyncInstruments, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateGenerateSignals, domain.StatePlaceEntryOrders, domain.StateHoldOvernight, domain.StateReconcile, domain.StateSleep},
 		domain.StateSyncInstruments:    {domain.StateSyncMarketData},
 		domain.StateSyncMarketData:     {domain.StateGenerateSignals},
-		domain.StateGenerateSignals:    {domain.StateWaitEntryWindow},
+		domain.StateGenerateSignals:    {domain.StateWaitEntryWindow, domain.StatePlaceEntryOrders, domain.StateHoldOvernight, domain.StateSleep},
 		domain.StateWaitEntryWindow:    {domain.StatePlaceEntryOrders, domain.StateSleep},
-		domain.StatePlaceEntryOrders:   {domain.StateMonitorEntryOrders, domain.StateReconcile},
-		domain.StateMonitorEntryOrders: {domain.StateHoldOvernight, domain.StateReconcile},
-		domain.StateHoldOvernight:      {domain.StateWaitExitWindow},
+		domain.StatePlaceEntryOrders:   {domain.StateMonitorEntryOrders, domain.StateHoldOvernight, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateReconcile},
+		domain.StateMonitorEntryOrders: {domain.StateHoldOvernight, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateReconcile},
+		domain.StateHoldOvernight:      {domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateReconcile},
 		domain.StateWaitExitWindow:     {domain.StatePlaceExitOrders},
 		domain.StatePlaceExitOrders:    {domain.StateMonitorExitOrders, domain.StateReconcile},
 		domain.StateMonitorExitOrders:  {domain.StateReconcile},
-		domain.StateReconcile:          {domain.StateReport, domain.StateHalted},
+		domain.StateReconcile:          {domain.StateReport, domain.StateHalted, domain.StateGenerateSignals, domain.StateSleep},
 		domain.StateReport:             {domain.StateSleep},
-		domain.StateSleep:              {domain.StateInit, domain.StateWaitExitWindow, domain.StateGenerateSignals},
+		domain.StateSleep:              {domain.StateInit, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateGenerateSignals, domain.StatePlaceEntryOrders, domain.StateHoldOvernight, domain.StateReconcile},
 	}
 	for _, candidate := range allowed[from] {
 		if candidate == to {

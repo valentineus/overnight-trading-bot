@@ -15,6 +15,8 @@ import (
 	"overnight-trading-bot/internal/tinvest"
 )
 
+var defaultCommissionTolerance = decimal.RequireFromString("0.01")
+
 type Engine struct {
 	repo                  repository.Repository
 	gateway               tinvest.Gateway
@@ -34,7 +36,7 @@ func New(repo repository.Repository, gateway tinvest.Gateway, accountID, account
 		accountID:           accountID,
 		accountIDHash:       accountIDHash,
 		window:              72 * time.Hour,
-		commissionTolerance: decimal.NewFromFloat(0.01),
+		commissionTolerance: defaultCommissionTolerance,
 	}
 }
 
@@ -164,7 +166,14 @@ func (e Engine) Run(ctx context.Context) ([]domain.ReconciliationDiff, error) {
 				continue
 			}
 			if err := e.repo.QuarantineInstrument(ctx, diff.InstrumentUID, diff.Message); err != nil {
-				return nil, err
+				_ = e.repo.InsertRiskEvent(ctx, domain.RiskEvent{
+					TS:            time.Now().UTC(),
+					Severity:      domain.SeverityCritical,
+					EventType:     "quarantine_failed",
+					InstrumentUID: diff.InstrumentUID,
+					Message:       err.Error(),
+					ContextJSON:   fmt.Sprintf(`{"reconciliation_diff":%q}`, diff.Message),
+				})
 			}
 		}
 	}
@@ -192,7 +201,7 @@ func HasCritical(diffs []domain.ReconciliationDiff) bool {
 }
 
 func compareOperations(orders []domain.Order, operations []domain.Operation) []domain.ReconciliationDiff {
-	return compareOperationsWithPolicy(orders, operations, false, decimal.NewFromFloat(0.01))
+	return compareOperationsWithPolicy(orders, operations, false, defaultCommissionTolerance)
 }
 
 func compareOperationsWithPolicy(orders []domain.Order, operations []domain.Operation, requireZeroCommission bool, commissionTolerance decimal.Decimal) []domain.ReconciliationDiff {

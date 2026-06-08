@@ -62,6 +62,21 @@ func TestUnhaltPreservesMode(t *testing.T) {
 	}
 }
 
+func TestCalendarRecoveryAllowsRestartInsideExitWindow(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	system := New(repo, domain.ModePaper)
+	if err := system.Transition(ctx, domain.StateInit, domain.StatePlaceExitOrders); err != nil {
+		t.Fatalf("INIT -> PLACE_EXIT_ORDERS should be legal on restart: %v", err)
+	}
+	if err := repo.SaveSystemState(ctx, domain.StateHoldOvernight, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Transition(ctx, domain.StateHoldOvernight, domain.StatePlaceExitOrders); err != nil {
+		t.Fatalf("HOLD_OVERNIGHT -> PLACE_EXIT_ORDERS should be legal on restart: %v", err)
+	}
+}
+
 func TestRecoverFromMonitorEntryHaltsOnCriticalReconciliationDiff(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

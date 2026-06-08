@@ -108,12 +108,6 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 	long := Rolling(overnight, cfg.RollingLong, cfg.EWMALambda)
 	adv := ADV(candles, instrument.Lot, 20)
 	rawEdgeBps := decimal.NewFromFloat(short.Mean).Mul(decimal.NewFromInt(10_000))
-	if !entryVolume.IsPositive() {
-		entryVolume = adv
-	}
-	if !exitVolume.IsPositive() {
-		exitVolume = adv
-	}
 	instrumentCommission := instrument.ExpectedCommissionBpsPerSide.Mul(decimal.NewFromInt(2))
 	expectedCost := spread.SpreadBps.
 		Add(cfg.EntrySlippageBps).

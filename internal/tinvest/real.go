@@ -246,6 +246,44 @@ func (g *RealGateway) GetPortfolio(ctx context.Context, accountID string) (domai
 	if err != nil {
 		return domain.Portfolio{}, err
 	}
+	return portfolioFromResponse(resp.PortfolioResponse)
+}
+
+func (g *RealGateway) GetOperations(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	resp, err := retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.OperationsResponse, error) {
+		return g.operations.GetOperations(&investgo.GetOperationsRequest{
+			AccountId: accountID,
+			From:      from,
+			To:        to,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return operationsFromResponse(resp.OperationsResponse), nil
+}
+
+func operationsFromResponse(resp *pb.OperationsResponse) []domain.Operation {
+	ops := resp.GetOperations()
+	out := make([]domain.Operation, 0, len(ops))
+	for _, op := range ops {
+		payment := money.MoneyValueToDecimal(op.GetPayment())
+		out = append(out, domain.Operation{
+			ID:            op.GetId(),
+			InstrumentUID: op.GetInstrumentUid(),
+			Type:          op.GetOperationType().String(),
+			Payment:       payment,
+			Commission:    operationCommission(op.GetOperationType(), payment),
+			ExecutedAt:    op.GetDate().AsTime().UTC(),
+		})
+	}
+	return out
+}
+
+func portfolioFromResponse(resp *pb.PortfolioResponse) (domain.Portfolio, error) {
 	positions := resp.GetPositions()
 	holdings := make([]domain.Holding, 0, len(positions))
 	for _, position := range positions {
@@ -270,36 +308,6 @@ func (g *RealGateway) GetPortfolio(ctx context.Context, accountID string) (domai
 		Holdings:  holdings,
 		CheckedAt: time.Now().UTC(),
 	}, nil
-}
-
-func (g *RealGateway) GetOperations(ctx context.Context, accountID string, from, to time.Time) ([]domain.Operation, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	resp, err := retryValue(ctx, g.retryAttempts, g.retryBackoff, func() (*investgo.OperationsResponse, error) {
-		return g.operations.GetOperations(&investgo.GetOperationsRequest{
-			AccountId: accountID,
-			From:      from,
-			To:        to,
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	ops := resp.GetOperations()
-	out := make([]domain.Operation, 0, len(ops))
-	for _, op := range ops {
-		payment := money.MoneyValueToDecimal(op.GetPayment())
-		out = append(out, domain.Operation{
-			ID:            op.GetId(),
-			InstrumentUID: op.GetInstrumentUid(),
-			Type:          op.GetOperationType().String(),
-			Payment:       payment,
-			Commission:    operationCommission(op.GetOperationType(), payment),
-			ExecutedAt:    op.GetDate().AsTime().UTC(),
-		})
-	}
-	return out, nil
 }
 
 func (g *RealGateway) GetServerTime(ctx context.Context) (time.Time, error) {

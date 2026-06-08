@@ -9,8 +9,11 @@ import (
 
 	"overnight-trading-bot/internal/domain"
 	"overnight-trading-bot/internal/execution"
+	"overnight-trading-bot/internal/marketdata"
+	"overnight-trading-bot/internal/position"
 	"overnight-trading-bot/internal/reconciliation"
 	"overnight-trading-bot/internal/risk"
+	signalengine "overnight-trading-bot/internal/signal"
 	"overnight-trading-bot/internal/statemachine"
 	"overnight-trading-bot/internal/testutil"
 	"overnight-trading-bot/internal/timeutil"
@@ -317,12 +320,263 @@ func TestSizeReductionRuleCutsSizerAfterBadExpectedErrors(t *testing.T) {
 	}
 }
 
+func TestBatchSignalLimitsCapSlotsAndExposure(t *testing.T) {
+	s := Scheduler{
+		cfg: Config{MaxOpenPositions: 5},
+		svc: Services{Sizer: risk.NewSizer(risk.SizingConfig{
+			MaxPositionPct:             decimal.NewFromInt(1),
+			MaxTotalExposurePct:        decimal.RequireFromString("0.50"),
+			MaxParticipationRate:       decimal.NewFromInt(1),
+			CashUsageBuffer:            decimal.NewFromInt(1),
+			RiskBudgetPerInstrumentPct: decimal.NewFromInt(1),
+			MinOrderNotionalRUB:        decimal.NewFromInt(1),
+		})},
+	}
+	book := domain.OrderBook{
+		Bids: []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks: []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+	}
+	generated := make([]signalCandidate, 0, 9)
+	for i := 0; i < 9; i++ {
+		uid := string(rune('a' + i))
+		generated = append(generated, signalCandidate{
+			Signal: domain.Signal{
+				InstrumentUID: uid,
+				Decision:      domain.DecisionEnter,
+				Score:         decimal.NewFromInt(int64(100 - i)),
+			},
+			Instrument: domain.Instrument{InstrumentUID: uid, Lot: 1, MinPriceIncrement: decimal.NewFromInt(1)},
+			Feature: domain.FeatureSet{
+				EntryIntervalVolume: decimal.NewFromInt(1_000_000),
+				ExitIntervalVolume:  decimal.NewFromInt(1_000_000),
+				SigmaOn60:           decimal.NewFromInt(1),
+			},
+			Book: book,
+		})
+	}
+	s.applyBatchSignalLimits(domain.Portfolio{Equity: decimal.NewFromInt(100_000), Cash: decimal.NewFromInt(100_000)}, decimal.Zero, 0, generated)
+	enters := 0
+	total := decimal.Zero
+	for _, candidate := range generated {
+		if candidate.Signal.Decision == domain.DecisionEnter {
+			enters++
+			total = total.Add(candidate.Signal.TargetNotional)
+		}
+	}
+	if enters != 5 {
+		t.Fatalf("enter signals=%d, want 5", enters)
+	}
+	if total.GreaterThan(decimal.NewFromInt(50_000)) {
+		t.Fatalf("total target notional=%s exceeds 50%% exposure", total)
+	}
+	if generated[5].Signal.RejectReason != signalengine.ReasonMaxPositions {
+		t.Fatalf("sixth signal reason=%q, want max positions", generated[5].Signal.RejectReason)
+	}
+}
+
+func TestPlaceEntryRejectsWideSpreadBeforeOrder(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	instrument := domain.Instrument{
+		InstrumentUID:     "uid",
+		Ticker:            "TRUR",
+		ClassCode:         "TQTF",
+		Enabled:           true,
+		Lot:               1,
+		MinPriceIncrement: decimal.RequireFromString("0.01"),
+		Currency:          "RUB",
+	}
+	if err := repo.UpsertInstrument(ctx, instrument); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertSignal(ctx, domain.Signal{
+		TradeDate:     tradeDate,
+		InstrumentUID: "uid",
+		Decision:      domain.DecisionEnter,
+		Score:         decimal.NewFromInt(10),
+		TargetLots:    1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertFeature(ctx, domain.FeatureSet{
+		InstrumentUID:       "uid",
+		TradeDate:           tradeDate,
+		EntryIntervalVolume: decimal.NewFromInt(1_000_000),
+		ExitIntervalVolume:  decimal.NewFromInt(1_000_000),
+		SigmaOn60:           decimal.NewFromInt(1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := tinvest.NewFakeGateway()
+	gateway.OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(90), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(110), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	execEngine := execution.NewEngine(domain.ModePaper, "account", gateway, repo)
+	now := tradeDate.Add(18 * time.Hour)
+	s := Scheduler{
+		clock: fixedClock{now: now},
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			NoNewEntryAfter:  mustTOD("23:00:00"),
+			MaxQuoteAge:      time.Minute,
+			MarketClose:      mustTOD("23:30:00"),
+			MaxOpenPositions: 5,
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			Gateway:       gateway,
+			MarketData:    marketdata.NewLoader(repo, gateway),
+			Signals:       signalengine.New(signalengine.Config{MaxSpreadBpsDefault: decimal.NewFromInt(20)}),
+			Sizer:         risk.NewSizer(testSizingConfig()),
+			FreeOrders:    risk.NewFreeOrderBudget(repo),
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{MaxOpenPositions: 5}),
+			Execution:     &execEngine,
+			Positions:     position.NewManager(repo),
+			Notifier:      &countNotifier{},
+			AccountID:     "account",
+			AccountIDHash: "hash",
+		},
+	}
+	if err := repo.SaveSystemState(ctx, domain.StateWaitEntryWindow, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.placeEntryOrders(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := repo.ListOrders(ctx, "hash", tradeDate, tradeDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 0 {
+		t.Fatalf("orders=%+v, want no order on wide spread", orders)
+	}
+	if len(repo.RiskEvents) != 1 || repo.RiskEvents[0].EventType != "pre_trade_reject" {
+		t.Fatalf("risk events=%+v", repo.RiskEvents)
+	}
+}
+
+func TestPlaceExitUsesCurrentTradeDateForOrderAndFreeCounter(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	openDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	exitDate := openDate.AddDate(0, 0, 1)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Ticker:               "TRUR",
+		ClassCode:            "TQTF",
+		Enabled:              true,
+		Lot:                  1,
+		MinPriceIncrement:    decimal.RequireFromString("0.01"),
+		Currency:             "RUB",
+		FreeOrderLimitPerDay: 10,
+	}
+	if err := repo.UpsertInstrument(ctx, instrument); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertPosition(ctx, domain.Position{
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		OpenTradeDate: openDate,
+		Lots:          2,
+		Lot:           1,
+		AvgBuyPrice:   decimal.NewFromInt(100),
+		Status:        domain.PositionHoldingOvernight,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := tinvest.NewFakeGateway()
+	gateway.OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(100), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.RequireFromString("100.10"), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	execEngine := execution.NewEngine(domain.ModePaper, "account", gateway, repo)
+	s := Scheduler{
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			HardExitDeadline: mustTOD("23:00:00"),
+			MaxQuoteAge:      time.Minute,
+			MarketClose:      mustTOD("23:30:00"),
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			Gateway:       gateway,
+			MarketData:    marketdata.NewLoader(repo, gateway),
+			Signals:       signalengine.New(signalengine.Config{MaxSpreadBpsDefault: decimal.NewFromInt(20)}),
+			FreeOrders:    risk.NewFreeOrderBudget(repo),
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{}),
+			Execution:     &execEngine,
+			Positions:     position.NewManager(repo),
+			Reconcile:     reconciliation.New(repo, gateway, "account", "hash"),
+			Notifier:      &countNotifier{},
+			AccountID:     "account",
+			AccountIDHash: "hash",
+		},
+	}
+	if err := repo.SaveSystemState(ctx, domain.StateWaitExitWindow, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.placeExitOrders(ctx, exitDate.Add(10*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := repo.ListOrders(ctx, "hash", exitDate, exitDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || !sameTradingDate(orders[0].TradeDate, exitDate) {
+		t.Fatalf("orders=%+v, want one exit order on current date", orders)
+	}
+	sentToday, err := repo.GetFreeOrdersSent(ctx, exitDate, "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentOpenDate, err := repo.GetFreeOrdersSent(ctx, openDate, "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sentToday != 1 || sentOpenDate != 0 {
+		t.Fatalf("free counters today=%d openDate=%d, want 1/0", sentToday, sentOpenDate)
+	}
+}
+
 func mustTOD(raw string) timeutil.TimeOfDay {
 	tod, err := timeutil.ParseTimeOfDay(raw)
 	if err != nil {
 		panic(err)
 	}
 	return tod
+}
+
+func testSizingConfig() risk.SizingConfig {
+	return risk.SizingConfig{
+		MaxPositionPct:             decimal.NewFromInt(1),
+		MaxTotalExposurePct:        decimal.NewFromInt(1),
+		MaxParticipationRate:       decimal.NewFromInt(1),
+		CashUsageBuffer:            decimal.NewFromInt(1),
+		RiskBudgetPerInstrumentPct: decimal.NewFromInt(1),
+		MinOrderNotionalRUB:        decimal.NewFromInt(1),
+	}
+}
+
+type fixedClock struct {
+	now time.Time
+}
+
+func (c fixedClock) Now() time.Time {
+	return c.now
+}
+
+func (fixedClock) Sleep(<-chan struct{}, time.Duration) bool {
+	return true
 }
 
 type countNotifier struct {
