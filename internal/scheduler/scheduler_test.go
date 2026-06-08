@@ -1200,7 +1200,105 @@ func TestPlaceExitUsesCurrentTradeDateForOrderAndFreeCounter(t *testing.T) {
 	}
 }
 
-func TestGracefulShutdownCancelsActiveOrders(t *testing.T) {
+func TestMonitorExitOrdersReinitializesMissingActiveSell(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	openDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	exitDate := openDate.AddDate(0, 0, 1)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Ticker:               "TRUR",
+		ClassCode:            "TQTF",
+		Enabled:              true,
+		Lot:                  1,
+		MinPriceIncrement:    decimal.RequireFromString("0.01"),
+		Currency:             "RUB",
+		FreeOrderLimitPerDay: -1,
+	}
+	if err := repo.UpsertInstrument(ctx, instrument); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertPosition(ctx, domain.Position{
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		OpenTradeDate: openDate,
+		Lots:          2,
+		Lot:           1,
+		AvgBuyPrice:   decimal.NewFromInt(100),
+		Status:        domain.PositionExitOrderSent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cancelledSell := domain.Order{
+		ClientOrderID: "old-sell",
+		BrokerOrderID: "broker-old-sell",
+		AccountIDHash: "hash",
+		InstrumentUID: "uid",
+		TradeDate:     exitDate,
+		Side:          domain.SideSell,
+		OrderType:     domain.OrderTypeLimit,
+		LimitPrice:    decimal.NewFromInt(100),
+		QuantityLots:  2,
+		Status:        domain.OrderStatusCancelled,
+		RawStateJSON:  "{}",
+	}
+	if err := repo.UpsertOrder(ctx, cancelledSell); err != nil {
+		t.Fatal(err)
+	}
+	gateway := tinvest.NewFakeGateway()
+	gateway.OrderBooks["uid"] = domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(100), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.RequireFromString("100.10"), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	execEngine := execution.NewEngine(domain.ModePaper, "account", gateway, repo)
+	s := Scheduler{
+		cfg: Config{
+			Mode:             domain.ModePaper,
+			Location:         time.UTC,
+			HardExitDeadline: mustTOD("23:00:00"),
+		},
+		sm: statemachine.New(repo, domain.ModePaper),
+		svc: Services{
+			Repo:          repo,
+			Gateway:       gateway,
+			MarketData:    marketdata.NewLoader(repo, gateway),
+			Signals:       signalengine.New(signalengine.Config{}),
+			FreeOrders:    risk.NewFreeOrderBudget(repo),
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{}),
+			Execution:     &execEngine,
+			Positions:     position.NewManager(repo),
+			Notifier:      &countNotifier{},
+			AccountID:     "account",
+			AccountIDHash: "hash",
+		},
+	}
+	if err := repo.SaveSystemState(ctx, domain.StateMonitorExitOrders, domain.ModePaper, false, "", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.monitorExitOrders(ctx, exitDate.Add(10*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := repo.ListOrders(ctx, "hash", exitDate, exitDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeSellCount := 0
+	for _, order := range orders {
+		if order.Side == domain.SideSell && order.Status == domain.OrderStatusSent && order.BrokerOrderID != "" {
+			activeSellCount++
+		}
+	}
+	if activeSellCount != 1 {
+		t.Fatalf("orders=%+v, want one newly active sell order", orders)
+	}
+	if repo.State != domain.StateMonitorExitOrders {
+		t.Fatalf("state=%s, want MONITOR_EXIT_ORDERS after reinit", repo.State)
+	}
+}
+
+func TestGracefulShutdownCancelsActiveBuyOrdersOnly(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
 	gateway := tinvest.NewFakeGateway()
@@ -1222,6 +1320,14 @@ func TestGracefulShutdownCancelsActiveOrders(t *testing.T) {
 		t.Fatal(err)
 	}
 	gateway.Orders[order.BrokerOrderID] = order
+	sell := order
+	sell.ClientOrderID = "shutdown-sell-order"
+	sell.BrokerOrderID = "broker-shutdown-sell-order"
+	sell.Side = domain.SideSell
+	if err := repo.UpsertOrder(ctx, sell); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Orders[sell.BrokerOrderID] = sell
 	execEngine := execution.NewEngine(domain.ModeSandbox, "account", gateway, repo)
 	s := Scheduler{
 		cfg: Config{Mode: domain.ModeSandbox},
@@ -1238,8 +1344,15 @@ func TestGracefulShutdownCancelsActiveOrders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(orders) != 1 || orders[0].Status != domain.OrderStatusCancelled {
-		t.Fatalf("orders=%+v, want cancelled", orders)
+	byClientID := make(map[string]domain.Order, len(orders))
+	for _, order := range orders {
+		byClientID[order.ClientOrderID] = order
+	}
+	if byClientID["shutdown-order"].Status != domain.OrderStatusCancelled {
+		t.Fatalf("orders=%+v, want buy cancelled", orders)
+	}
+	if byClientID["shutdown-sell-order"].Status != domain.OrderStatusSent {
+		t.Fatalf("orders=%+v, want sell left active", orders)
 	}
 }
 

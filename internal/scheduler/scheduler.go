@@ -135,10 +135,7 @@ func (s Scheduler) GracefulShutdown(ctx context.Context) error {
 	if s.svc.Repo == nil || s.svc.Execution == nil {
 		return nil
 	}
-	if err := s.cancelActiveOrders(ctx, domain.SideBuy, domain.OrderStatusCancelled, "shutdown_cancel_active_orders"); err != nil {
-		return err
-	}
-	return s.cancelActiveOrders(ctx, domain.SideSell, domain.OrderStatusCancelled, "shutdown_cancel_active_orders")
+	return s.cancelActiveOrders(ctx, domain.SideBuy, domain.OrderStatusCancelled, "shutdown_cancel_active_orders")
 }
 
 func (s *Scheduler) Step(ctx context.Context) error {
@@ -655,7 +652,7 @@ func (s *Scheduler) placeExitOrders(ctx context.Context, now time.Time) error {
 		return err
 	}
 	for _, pos := range positionsList {
-		if pos.Lots <= 0 || hasOrder(existing, pos.InstrumentUID, domain.SideSell) {
+		if pos.Lots <= 0 || hasActiveBrokerOrder(existing, pos.InstrumentUID, domain.SideSell) {
 			continue
 		}
 		instrument, ok := instrumentByUID[pos.InstrumentUID]
@@ -739,6 +736,7 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 	}
 	deadline := s.cfg.HardExitDeadline.On(now, s.cfg.Location).UTC()
 	exitTradeDate := tradingDate(now)
+	activeExitOrders := make([]domain.Order, 0, len(orders))
 	for _, order := range orders {
 		if order.Side != domain.SideSell || order.BrokerOrderID == "" || !sameTradingDate(order.TradeDate, exitTradeDate) {
 			continue
@@ -764,6 +762,9 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 		if err != nil {
 			return err
 		}
+		if isActiveOrder(monitored.Status) && monitored.BrokerOrderID != "" {
+			activeExitOrders = append(activeExitOrders, monitored)
+		}
 		previousFill := execution.AggregatedOrderFill(order)
 		if monitored.FilledLots > previousFill.FilledLots || monitored.Commission.GreaterThan(previousFill.Commission) {
 			fill := exitFillDelta(order, monitored)
@@ -781,8 +782,15 @@ func (s *Scheduler) monitorExitOrders(ctx context.Context, now time.Time) error 
 			positionByInstrument[monitored.InstrumentUID] = updated
 		}
 	}
-	if sinceMidnight(s.nowUTC().In(s.cfg.Location)) >= s.cfg.HardExitDeadline.Duration {
+	if sinceMidnight(now.In(s.cfg.Location)) >= s.cfg.HardExitDeadline.Duration {
 		return s.failOpenPositionsAtHardDeadline(ctx)
+	}
+	openPositions, err = s.svc.Repo.ListOpenPositions(ctx, s.svc.AccountIDHash)
+	if err != nil {
+		return err
+	}
+	if hasOpenPositionWithoutActiveExitOrder(openPositions, activeExitOrders, exitTradeDate) {
+		return s.placeExitOrders(ctx, now)
 	}
 	return nil
 }
@@ -1713,6 +1721,38 @@ func bestBidAsk(book domain.OrderBook) (decimal.Decimal, decimal.Decimal, error)
 func hasOrder(orders []domain.Order, instrumentUID string, side domain.Side) bool {
 	for _, order := range orders {
 		if order.InstrumentUID == instrumentUID && order.Side == side && order.Status != domain.OrderStatusFailed && order.Status != domain.OrderStatusRejected {
+			return true
+		}
+	}
+	return false
+}
+
+func hasActiveBrokerOrder(orders []domain.Order, instrumentUID string, side domain.Side) bool {
+	for _, order := range orders {
+		if order.InstrumentUID == instrumentUID && order.Side == side && order.BrokerOrderID != "" && isActiveOrder(order.Status) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOpenPositionWithoutActiveExitOrder(positions []domain.Position, orders []domain.Order, tradeDate time.Time) bool {
+	for _, pos := range positions {
+		if pos.Lots <= 0 {
+			continue
+		}
+		hasActiveSell := false
+		for _, order := range orders {
+			if order.InstrumentUID == pos.InstrumentUID &&
+				order.Side == domain.SideSell &&
+				order.BrokerOrderID != "" &&
+				sameTradingDate(order.TradeDate, tradeDate) &&
+				isActiveOrder(order.Status) {
+				hasActiveSell = true
+				break
+			}
+		}
+		if !hasActiveSell {
 			return true
 		}
 	}

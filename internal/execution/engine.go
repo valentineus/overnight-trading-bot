@@ -192,7 +192,14 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 	if err != nil {
 		draft.Status = domain.OrderStatusFailed
 		if e.store != nil {
-			_ = e.store.UpsertOrder(ctx, draft)
+			if persistErr := e.store.RunInTx(ctx, func(ctx context.Context, repo repository.Repository) error {
+				if err := repo.UpsertOrder(ctx, draft); err != nil {
+					return fmt.Errorf("persist failed order: %w", err)
+				}
+				return repo.IncrementFreeOrders(ctx, order.TradeDate, order.InstrumentUID, -1)
+			}); persistErr != nil {
+				return domain.Order{}, errors.Join(err, fmt.Errorf("rollback failed order reservation: %w", persistErr))
+			}
 		}
 		return domain.Order{}, err
 	}

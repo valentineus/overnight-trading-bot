@@ -111,6 +111,59 @@ func TestPlaceEntryReservesFreeOrderBudgetAtomically(t *testing.T) {
 	}
 }
 
+func TestPlaceEntryReleasesFreeOrderBudgetWhenBrokerRejects(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	engine := NewEngine(domain.ModeSandbox, "account", postErrorGateway{err: errors.New("broker rejected")}, repo)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: 1,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	_, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 1, book, 1, 1)
+	if err == nil {
+		t.Fatal("expected broker error")
+	}
+	sent, err := repo.GetFreeOrdersSent(ctx, tradeDate, "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 0 {
+		t.Fatalf("free order counter=%d, want rollback to 0", sent)
+	}
+	orders, err := repo.ListOrders(ctx, "hash", tradeDate, tradeDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Status != domain.OrderStatusFailed {
+		t.Fatalf("orders=%+v, want one failed local order", orders)
+	}
+}
+
+type postErrorGateway struct {
+	err error
+}
+
+func (g postErrorGateway) PostLimitOrder(context.Context, string, string, domain.Side, int64, decimal.Decimal, string) (domain.Order, error) {
+	return domain.Order{}, g.err
+}
+
+func (g postErrorGateway) CancelOrder(context.Context, string, string) error {
+	return nil
+}
+
+func (g postErrorGateway) GetOrderState(context.Context, string, string) (domain.Order, error) {
+	return domain.Order{}, g.err
+}
+
 func TestRefreshPreservesLocalQuoteContext(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

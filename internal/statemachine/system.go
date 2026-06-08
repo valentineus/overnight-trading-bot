@@ -109,7 +109,7 @@ func legalTransition(from, to domain.SystemState) bool {
 		domain.StateHoldOvernight:      {domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateReconcile},
 		domain.StateWaitExitWindow:     {domain.StatePlaceExitOrders},
 		domain.StatePlaceExitOrders:    {domain.StateMonitorExitOrders, domain.StateReconcile},
-		domain.StateMonitorExitOrders:  {domain.StateReconcile},
+		domain.StateMonitorExitOrders:  {domain.StatePlaceExitOrders, domain.StateReconcile},
 		domain.StateReconcile:          {domain.StateReport, domain.StateHalted, domain.StateGenerateSignals, domain.StateSleep},
 		domain.StateReport:             {domain.StateSleep},
 		domain.StateSleep:              {domain.StateInit, domain.StateWaitExitWindow, domain.StatePlaceExitOrders, domain.StateMonitorExitOrders, domain.StateGenerateSignals, domain.StatePlaceEntryOrders, domain.StateHoldOvernight, domain.StateReconcile},

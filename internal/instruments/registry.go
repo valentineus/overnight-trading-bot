@@ -29,7 +29,16 @@ func (r Registry) SyncMetadata(ctx context.Context) error {
 		}
 		remote, err := r.gateway.GetInstrument(ctx, instrument.Ticker, instrument.ClassCode)
 		if err != nil {
-			return fmt.Errorf("sync instrument metadata %s: %w", instrument.Ticker, err)
+			if insertErr := r.repo.InsertRiskEvent(ctx, domain.RiskEvent{
+				Severity:      domain.SeverityWarn,
+				EventType:     "instrument_metadata_sync_failed",
+				InstrumentUID: instrument.InstrumentUID,
+				Message:       fmt.Sprintf("sync instrument metadata %s: %s", instrument.Ticker, err),
+				ContextJSON:   fmt.Sprintf(`{"ticker":%q,"class_code":%q}`, instrument.Ticker, instrument.ClassCode),
+			}); insertErr != nil {
+				return fmt.Errorf("record metadata sync failure %s: %w", instrument.Ticker, insertErr)
+			}
+			continue
 		}
 		remote.Enabled = instrument.Enabled && remote.Enabled
 		remote.FundType = instrument.FundType
