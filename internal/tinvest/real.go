@@ -59,7 +59,7 @@ func NewRealGateway(ctx context.Context, opts Options) (*RealGateway, error) {
 		AppName:    opts.AppName,
 		AccountId:  opts.AccountID,
 		MaxRetries: 0,
-	}, logging.SDKLogger{Logger: opts.Logger})
+	}, logging.NewSDKLogger(opts.Logger))
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +154,37 @@ func (g *RealGateway) GetCandles(ctx context.Context, instrumentUID string, inte
 		})
 	}
 	return out, nil
+}
+
+func (g *RealGateway) GetTradingDays(ctx context.Context, exchange string, from, to time.Time) ([]time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	resp, err := requestWithTimeout(ctx, g.requestTimeout, func(callCtx context.Context) (*pb.TradingSchedulesResponse, error) {
+		return retryValue(callCtx, g.retryAttempts, g.retryBackoff, func() (*pb.TradingSchedulesResponse, error) {
+			return g.instrumentsPB.TradingSchedules(callCtx, &pb.TradingSchedulesRequest{
+				Exchange: &exchange,
+				From:     investgo.TimeToTimestamp(from),
+				To:       investgo.TimeToTimestamp(to),
+			})
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	var days []time.Time
+	for _, schedule := range resp.GetExchanges() {
+		if !strings.EqualFold(schedule.GetExchange(), exchange) {
+			continue
+		}
+		for _, day := range schedule.GetDays() {
+			if !day.GetIsTradingDay() || day.GetDate() == nil {
+				continue
+			}
+			days = append(days, dateOnly(day.GetDate().AsTime()))
+		}
+	}
+	return days, nil
 }
 
 func (g *RealGateway) GetOrderBook(ctx context.Context, instrumentUID string, depth int32) (domain.OrderBook, error) {

@@ -34,3 +34,26 @@ func TestSlogRedactsSensitiveAccountIDAttributes(t *testing.T) {
 		t.Fatalf("log did not redact account ids: %s", got)
 	}
 }
+
+func TestSDKLoggerRedactsTemplateAndArgs(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New("info", &buf)
+	sdk := NewSDKLogger(logger)
+	sdk.Infof("token=plain-token account_id=plain-account", "accountID=arg-account", `{"token":"json-token"}`)
+	got := buf.String()
+	for _, secret := range []string{"plain-token", "plain-account", "arg-account", "json-token"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("SDK log leaked %q: %s", secret, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("SDK log did not redact sensitive data: %s", got)
+	}
+}
+
+func TestSDKLoggerNilIsNoop(t *testing.T) {
+	sdk := NewSDKLogger(nil)
+	sdk.Infof("token=plain-token")
+	sdk.Errorf("account_id=plain-account")
+	sdk.Fatalf("token=plain-token")
+}

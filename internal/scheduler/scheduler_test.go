@@ -21,6 +21,8 @@ import (
 	"overnight-trading-bot/internal/tinvest"
 )
 
+const sizeReductionWindowTrades = 20
+
 func TestPhaseUsesMoscowWindows(t *testing.T) {
 	loc := time.FixedZone("MSK", 3*60*60)
 	s := Scheduler{cfg: Config{

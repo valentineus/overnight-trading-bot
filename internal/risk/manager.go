@@ -3,12 +3,15 @@ package risk
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/shopspring/decimal"
 
 	"overnight-trading-bot/internal/domain"
 )
+
+var exitProcess = os.Exit
 
 type EventSink interface {
 	InsertRiskEvent(ctx context.Context, event domain.RiskEvent) error
@@ -63,6 +66,11 @@ func (m Manager) Halt(ctx context.Context, mode domain.Mode, eventType, reason s
 	if m.sink == nil {
 		return nil
 	}
+	if err := m.sink.SaveSystemState(ctx, domain.StateHalted, mode, true, reason, "{}"); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "fail-stop: persist halt state: %v\n", err)
+		exitProcess(1)
+		return fmt.Errorf("persist halt state: %w", err)
+	}
 	event := domain.RiskEvent{
 		TS:            time.Now().UTC(),
 		Severity:      domain.SeverityCritical,
@@ -72,9 +80,6 @@ func (m Manager) Halt(ctx context.Context, mode domain.Mode, eventType, reason s
 	}
 	if err := m.sink.InsertRiskEvent(ctx, event); err != nil {
 		return fmt.Errorf("insert halt risk event: %w", err)
-	}
-	if err := m.sink.SaveSystemState(ctx, domain.StateHalted, mode, true, reason, "{}"); err != nil {
-		return fmt.Errorf("persist halt state: %w", err)
 	}
 	return nil
 }

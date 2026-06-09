@@ -174,6 +174,47 @@ func TestComputeAllowsWeekendGap(t *testing.T) {
 	}
 }
 
+func TestComputeAllowsHolidayGapWithTradingCalendar(t *testing.T) {
+	monday := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+	wednesday := monday.AddDate(0, 0, 2)
+	candles := []domain.Candle{
+		{InstrumentUID: "uid", TradeDate: monday, Open: decimal.NewFromInt(100), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+		{InstrumentUID: "uid", TradeDate: wednesday, Open: decimal.NewFromInt(101), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+	}
+	got, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, wednesday.AddDate(0, 0, 1), SpreadResult{}, PipelineConfig{
+		RollingShort: 1,
+		RollingLong:  1,
+		EWMALambda:   0.08,
+		TradingDays:  []time.Time{monday, wednesday},
+	}, decimal.Zero, decimal.Zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decimal.RequireFromString("0.01")
+	if !got.ROn.Equal(want) {
+		t.Fatalf("ROn=%s, want %s across holiday gap", got.ROn, want)
+	}
+}
+
+func TestComputeRejectsMissingTradingDayWithTradingCalendar(t *testing.T) {
+	monday := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+	tuesday := monday.AddDate(0, 0, 1)
+	wednesday := monday.AddDate(0, 0, 2)
+	candles := []domain.Candle{
+		{InstrumentUID: "uid", TradeDate: monday, Open: decimal.NewFromInt(100), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+		{InstrumentUID: "uid", TradeDate: wednesday, Open: decimal.NewFromInt(101), Close: decimal.NewFromInt(100), VolumeLots: decimal.NewFromInt(1)},
+	}
+	_, err := Compute(domain.Instrument{InstrumentUID: "uid", Lot: 1}, candles, wednesday.AddDate(0, 0, 1), SpreadResult{}, PipelineConfig{
+		RollingShort: 1,
+		RollingLong:  1,
+		EWMALambda:   0.08,
+		TradingDays:  []time.Time{monday, tuesday, wednesday},
+	}, decimal.Zero, decimal.Zero)
+	if err == nil {
+		t.Fatal("expected missing trading day to make overnight pair unavailable")
+	}
+}
+
 func flatCandles(start time.Time, count int) []domain.Candle {
 	candles := make([]domain.Candle, 0, count)
 	for i := 0; i < count; i++ {

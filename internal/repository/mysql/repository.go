@@ -606,8 +606,15 @@ ON DUPLICATE KEY UPDATE orders_sent=orders_sent+VALUES(orders_sent)`, dateOnly(t
 }
 
 func (r *Repository) ReserveFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+	return r.ReserveFreeOrdersWithRequired(ctx, tradeDate, instrumentUID, delta, delta, limit)
+}
+
+func (r *Repository) ReserveFreeOrdersWithRequired(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, required int, limit int) error {
 	if delta <= 0 {
 		return nil
+	}
+	if required < delta {
+		required = delta
 	}
 	if limit <= 0 {
 		return r.IncrementFreeOrders(ctx, tradeDate, instrumentUID, delta)
@@ -617,11 +624,11 @@ func (r *Repository) ReserveFreeOrders(ctx context.Context, tradeDate time.Time,
 		if !ok {
 			return errors.New("unexpected repository implementation")
 		}
-		return txRepo.reserveFreeOrdersLocked(ctx, tradeDate, instrumentUID, delta, limit)
+		return txRepo.reserveFreeOrdersLocked(ctx, tradeDate, instrumentUID, delta, required, limit)
 	})
 }
 
-func (r *Repository) reserveFreeOrdersLocked(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+func (r *Repository) reserveFreeOrdersLocked(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, required int, limit int) error {
 	tradeDay := dateOnly(tradeDate)
 	if _, err := r.execer().ExecContext(ctx, `
 INSERT IGNORE INTO free_order_counters (trade_date, instrument_uid, orders_sent)
@@ -636,8 +643,8 @@ FOR UPDATE`, tradeDay, instrumentUID); err != nil {
 		return err
 	}
 	remaining := limit - sent
-	if remaining < delta {
-		return fmt.Errorf("%w: %s remaining=%d needed=%d", risk.ErrFreeOrderBudget, instrumentUID, remaining, delta)
+	if remaining < required {
+		return fmt.Errorf("%w: %s remaining=%d needed=%d", risk.ErrFreeOrderBudget, instrumentUID, remaining, required)
 	}
 	_, err := r.execer().ExecContext(ctx, `
 UPDATE free_order_counters

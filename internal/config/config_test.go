@@ -44,6 +44,48 @@ func TestValidateLiveTradeAcceptsAllPreconditions(t *testing.T) {
 	}
 }
 
+func TestLoadKeepsStrategyExpectedSlippageSeparateFromBacktest(t *testing.T) {
+	t.Setenv("APP_MODE", "backtest")
+	t.Setenv("STRATEGY_EXPECTED_ENTRY_SLIPPAGE_BPS", "2")
+	t.Setenv("STRATEGY_EXPECTED_EXIT_SLIPPAGE_BPS", "3")
+	t.Setenv("BT_ENTRY_SLIPPAGE_BPS", "11")
+	t.Setenv("BT_EXIT_SLIPPAGE_BPS", "13")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Strategy.ExpectedEntrySlippageBps.Equal(decimal.NewFromInt(2)) || !cfg.Strategy.ExpectedExitSlippageBps.Equal(decimal.NewFromInt(3)) {
+		t.Fatalf("strategy slippage entry=%s exit=%s, want 2/3", cfg.Strategy.ExpectedEntrySlippageBps, cfg.Strategy.ExpectedExitSlippageBps)
+	}
+	if !cfg.Backtest.EntrySlippageBps.Equal(decimal.NewFromInt(11)) || !cfg.Backtest.ExitSlippageBps.Equal(decimal.NewFromInt(13)) {
+		t.Fatalf("backtest slippage entry=%s exit=%s, want 11/13", cfg.Backtest.EntrySlippageBps, cfg.Backtest.ExitSlippageBps)
+	}
+}
+
+func TestLoadSchedulerKnobsFromEnv(t *testing.T) {
+	t.Setenv("APP_MODE", "backtest")
+	t.Setenv("STRATEGY_INTERVAL_VOLUME_LOOKBACK_DAYS", "12")
+	t.Setenv("RISK_SIZE_REDUCTION_WINDOW_TRADES", "7")
+	t.Setenv("RISK_SIZE_REDUCTION_FACTOR", "0.25")
+	t.Setenv("RISK_SIZE_REDUCTION_TRIGGER_BPS", "-5")
+	t.Setenv("TINVEST_TRADING_CALENDAR_EXCHANGE", "MOEX_FOND")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Strategy.IntervalVolumeLookbackDays != 12 || cfg.Risk.SizeReductionWindowTrades != 7 {
+		t.Fatalf("window config strategy=%d risk=%d, want 12/7", cfg.Strategy.IntervalVolumeLookbackDays, cfg.Risk.SizeReductionWindowTrades)
+	}
+	if !cfg.Risk.SizeReductionFactor.Equal(decimal.RequireFromString("0.25")) || !cfg.Risk.SizeReductionTriggerBps.Equal(decimal.NewFromInt(-5)) {
+		t.Fatalf("size reduction factor=%s trigger=%s, want 0.25/-5", cfg.Risk.SizeReductionFactor, cfg.Risk.SizeReductionTriggerBps)
+	}
+	if cfg.TInvest.TradingCalendarExchange != "MOEX_FOND" {
+		t.Fatalf("calendar exchange=%q, want MOEX_FOND", cfg.TInvest.TradingCalendarExchange)
+	}
+}
+
 func minimalBrokerConfig(mode domain.Mode) Config {
 	return Config{
 		App: AppConfig{

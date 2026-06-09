@@ -27,6 +27,7 @@ type PipelineConfig struct {
 	EntryWindow            timeutil.Window
 	ExitWindow             timeutil.Window
 	IntervalVolumeLookback int
+	TradingDays            []time.Time
 	Location               *time.Location
 }
 
@@ -37,6 +38,11 @@ type Pipeline struct {
 
 func NewPipeline(repo repository.Repository, cfg PipelineConfig) Pipeline {
 	return Pipeline{repo: repo, cfg: cfg}
+}
+
+func (p Pipeline) WithTradingDays(days []time.Time) Pipeline {
+	p.cfg.TradingDays = days
+	return p
 }
 
 func (p Pipeline) Recompute(ctx context.Context, instrument domain.Instrument, tradeDate time.Time, spread SpreadResult) (domain.FeatureSet, error) {
@@ -94,8 +100,9 @@ func Compute(instrument domain.Instrument, candles []domain.Candle, tradeDate ti
 	var overnight []float64
 	var lastROn decimal.Decimal
 	var lastRDay decimal.Decimal
+	calendar := tradingCalendarFrom(cfg.TradingDays)
 	for i := 1; i < len(candles); i++ {
-		if !consecutiveDailyCandles(candles[i-1].TradeDate, candles[i].TradeDate) {
+		if !consecutiveDailyCandles(candles[i-1].TradeDate, candles[i].TradeDate, calendar) {
 			continue
 		}
 		rOn, err := OvernightReturn(candles[i].Open, candles[i-1].Close)
@@ -207,11 +214,33 @@ func historicalDailyCandles(candles []domain.Candle, tradeDate time.Time) []doma
 	return out
 }
 
-func consecutiveDailyCandles(previous, current time.Time) bool {
+type tradingCalendar map[string]struct{}
+
+func tradingCalendarFrom(days []time.Time) tradingCalendar {
+	if len(days) == 0 {
+		return nil
+	}
+	calendar := make(tradingCalendar, len(days))
+	for _, day := range days {
+		calendar[dateOnly(day).Format("2006-01-02")] = struct{}{}
+	}
+	return calendar
+}
+
+func consecutiveDailyCandles(previous, current time.Time, calendar tradingCalendar) bool {
 	prevDay := dateOnly(previous)
 	currentDay := dateOnly(current)
 	if !currentDay.After(prevDay) {
 		return false
+	}
+	if len(calendar) > 0 {
+		tradingDays := 0
+		for day := prevDay.AddDate(0, 0, 1); !day.After(currentDay); day = day.AddDate(0, 0, 1) {
+			if _, ok := calendar[day.Format("2006-01-02")]; ok {
+				tradingDays++
+			}
+		}
+		return tradingDays == 1
 	}
 	weekdays := 0
 	for day := prevDay.AddDate(0, 0, 1); !day.After(currentDay); day = day.AddDate(0, 0, 1) {

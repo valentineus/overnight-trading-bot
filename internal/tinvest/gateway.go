@@ -17,6 +17,7 @@ var ErrNotFound = errors.New("not found")
 type Gateway interface {
 	GetInstrument(ctx context.Context, ticker, classCode string) (domain.Instrument, error)
 	GetCandles(ctx context.Context, instrumentUID string, interval string, from, to time.Time) ([]domain.Candle, error)
+	GetTradingDays(ctx context.Context, exchange string, from, to time.Time) ([]time.Time, error)
 	GetOrderBook(ctx context.Context, instrumentUID string, depth int32) (domain.OrderBook, error)
 	GetTradingStatus(ctx context.Context, instrumentUID string) (domain.TradingStatus, error)
 	PostLimitOrder(ctx context.Context, accountID, instrumentUID string, side domain.Side, lots int64, price decimal.Decimal, clientOrderID string) (domain.Order, error)
@@ -34,6 +35,8 @@ type FakeGateway struct {
 	InstrumentErrors map[string]error
 	Candles          map[string][]domain.Candle
 	CandleErrors     map[string]error
+	TradingDays      []time.Time
+	TradingDayError  error
 	OrderBooks       map[string]domain.OrderBook
 	Statuses         map[string]domain.TradingStatus
 	Orders           map[string]domain.Order
@@ -83,6 +86,22 @@ func (f *FakeGateway) GetCandles(_ context.Context, instrumentUID string, _ stri
 	for _, candle := range f.Candles[instrumentUID] {
 		if !candle.TradeDate.Before(from) && !candle.TradeDate.After(to) {
 			out = append(out, candle)
+		}
+	}
+	return out, nil
+}
+
+func (f *FakeGateway) GetTradingDays(_ context.Context, _ string, from, to time.Time) ([]time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.TradingDayError != nil {
+		return nil, f.TradingDayError
+	}
+	var out []time.Time
+	for _, day := range f.TradingDays {
+		day = dateOnly(day)
+		if !day.Before(dateOnly(from)) && !day.After(dateOnly(to)) {
+			out = append(out, day)
 		}
 	}
 	return out, nil
@@ -224,6 +243,11 @@ func (f *FakeGateway) GetServerTime(context.Context) (time.Time, error) {
 		return time.Now().UTC(), nil
 	}
 	return f.ServerTime, nil
+}
+
+func dateOnly(ts time.Time) time.Time {
+	year, month, day := ts.UTC().Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 }
 
 func isTerminalFakeOrder(status domain.OrderStatus) bool {

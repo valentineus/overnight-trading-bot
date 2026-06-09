@@ -46,14 +46,15 @@ type AppConfig struct {
 }
 
 type TInvestConfig struct {
-	Token             string `env:"TOKEN"`
-	AccountID         string `env:"ACCOUNT_ID"`
-	Endpoint          string `env:"ENDPOINT" envDefault:"invest-public-api.tinkoff.ru:443"`
-	AppName           string `env:"APP_NAME" envDefault:"overnight-trading-bot"`
-	RequestTimeoutSec int    `env:"REQUEST_TIMEOUT_SEC" envDefault:"10"`
-	RetryCount        int    `env:"RETRY_COUNT" envDefault:"3"`
-	RetryBackoffSec   int    `env:"RETRY_BACKOFF_SEC" envDefault:"2"`
-	UseSandbox        bool   `env:"USE_SANDBOX" envDefault:"false"`
+	Token                   string `env:"TOKEN"`
+	AccountID               string `env:"ACCOUNT_ID"`
+	Endpoint                string `env:"ENDPOINT" envDefault:"invest-public-api.tinkoff.ru:443"`
+	AppName                 string `env:"APP_NAME" envDefault:"overnight-trading-bot"`
+	RequestTimeoutSec       int    `env:"REQUEST_TIMEOUT_SEC" envDefault:"10"`
+	RetryCount              int    `env:"RETRY_COUNT" envDefault:"3"`
+	RetryBackoffSec         int    `env:"RETRY_BACKOFF_SEC" envDefault:"2"`
+	UseSandbox              bool   `env:"USE_SANDBOX" envDefault:"false"`
+	TradingCalendarExchange string `env:"TRADING_CALENDAR_EXCHANGE" envDefault:"MOEX"`
 }
 
 type DBConfig struct {
@@ -74,15 +75,18 @@ type TelegramConfig struct {
 }
 
 type StrategyConfig struct {
-	RollingShort     int             `env:"ROLLING_SHORT" envDefault:"60"`
-	RollingLong      int             `env:"ROLLING_LONG" envDefault:"252"`
-	EWMALambda       float64         `env:"EWMA_LAMBDA" envDefault:"0.08"`
-	AllocationMethod string          `env:"ALLOCATION_METHOD" envDefault:"equal_weight"`
-	MinTStat60       decimal.Decimal `env:"MIN_TSTAT_60" envDefault:"1.25"`
-	MinWinRate60     decimal.Decimal `env:"MIN_WIN_RATE_60" envDefault:"0.55"`
-	MinNetEdgeBps    decimal.Decimal `env:"MIN_NET_EDGE_BPS" envDefault:"10"`
-	RiskBufferBps    decimal.Decimal `env:"RISK_BUFFER_BPS" envDefault:"5"`
-	MaxPositions     int             `env:"MAX_POSITIONS" envDefault:"5"`
+	RollingShort               int             `env:"ROLLING_SHORT" envDefault:"60"`
+	RollingLong                int             `env:"ROLLING_LONG" envDefault:"252"`
+	EWMALambda                 float64         `env:"EWMA_LAMBDA" envDefault:"0.08"`
+	AllocationMethod           string          `env:"ALLOCATION_METHOD" envDefault:"equal_weight"`
+	MinTStat60                 decimal.Decimal `env:"MIN_TSTAT_60" envDefault:"1.25"`
+	MinWinRate60               decimal.Decimal `env:"MIN_WIN_RATE_60" envDefault:"0.55"`
+	MinNetEdgeBps              decimal.Decimal `env:"MIN_NET_EDGE_BPS" envDefault:"10"`
+	RiskBufferBps              decimal.Decimal `env:"RISK_BUFFER_BPS" envDefault:"5"`
+	ExpectedEntrySlippageBps   decimal.Decimal `env:"EXPECTED_ENTRY_SLIPPAGE_BPS" envDefault:"8"`
+	ExpectedExitSlippageBps    decimal.Decimal `env:"EXPECTED_EXIT_SLIPPAGE_BPS" envDefault:"8"`
+	IntervalVolumeLookbackDays int             `env:"INTERVAL_VOLUME_LOOKBACK_DAYS" envDefault:"20"`
+	MaxPositions               int             `env:"MAX_POSITIONS" envDefault:"5"`
 }
 
 type ExecutionConfig struct {
@@ -124,6 +128,9 @@ type RiskConfig struct {
 	CashUsageBuffer            decimal.Decimal `env:"CASH_USAGE_BUFFER" envDefault:"0.95"`
 	RiskBudgetPerInstrumentPct decimal.Decimal `env:"RISK_BUDGET_PER_INSTRUMENT_PCT" envDefault:"0.005"`
 	MinOrderNotionalRUB        decimal.Decimal `env:"MIN_ORDER_NOTIONAL_RUB" envDefault:"1000"`
+	SizeReductionWindowTrades  int             `env:"SIZE_REDUCTION_WINDOW_TRADES" envDefault:"20"`
+	SizeReductionFactor        decimal.Decimal `env:"SIZE_REDUCTION_FACTOR" envDefault:"0.5"`
+	SizeReductionTriggerBps    decimal.Decimal `env:"SIZE_REDUCTION_TRIGGER_BPS" envDefault:"-10"`
 }
 
 type LiquidityConfig struct {
@@ -194,6 +201,9 @@ func (c *Config) Validate() error {
 	if c.TInvest.RequestTimeoutSec <= 0 {
 		return errors.New("TINVEST_REQUEST_TIMEOUT_SEC must be positive")
 	}
+	if c.TInvest.TradingCalendarExchange == "" {
+		c.TInvest.TradingCalendarExchange = "MOEX"
+	}
 	if c.Execution.AllowMarketOrders {
 		return errors.New("EXEC_ALLOW_MARKET_ORDERS must remain false: strategy is LIMIT-only")
 	}
@@ -221,6 +231,18 @@ func (c *Config) Validate() error {
 	if c.Risk.CommissionToleranceRUB.IsNegative() {
 		return errors.New("RISK_COMMISSION_TOLERANCE_RUB must be non-negative")
 	}
+	if c.Risk.SizeReductionWindowTrades == 0 {
+		c.Risk.SizeReductionWindowTrades = 20
+	}
+	if c.Risk.SizeReductionWindowTrades < 0 {
+		return errors.New("RISK_SIZE_REDUCTION_WINDOW_TRADES must be positive")
+	}
+	if c.Risk.SizeReductionFactor.IsZero() {
+		c.Risk.SizeReductionFactor = decimal.RequireFromString("0.5")
+	}
+	if !c.Risk.SizeReductionFactor.IsPositive() || c.Risk.SizeReductionFactor.GreaterThan(decimal.NewFromInt(1)) {
+		return errors.New("RISK_SIZE_REDUCTION_FACTOR must be in (0, 1]")
+	}
 	if c.Commission.FreeOrderCountPolicy == "" {
 		c.Commission.FreeOrderCountPolicy = "submitted"
 	}
@@ -234,6 +256,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Strategy.AllocationMethod != "equal_weight" {
 		return fmt.Errorf("STRATEGY_ALLOCATION_METHOD must be equal_weight, got %q", c.Strategy.AllocationMethod)
+	}
+	if c.Strategy.ExpectedEntrySlippageBps.IsNegative() {
+		return errors.New("STRATEGY_EXPECTED_ENTRY_SLIPPAGE_BPS must be non-negative")
+	}
+	if c.Strategy.ExpectedExitSlippageBps.IsNegative() {
+		return errors.New("STRATEGY_EXPECTED_EXIT_SLIPPAGE_BPS must be non-negative")
+	}
+	if c.Strategy.IntervalVolumeLookbackDays == 0 {
+		c.Strategy.IntervalVolumeLookbackDays = 20
+	}
+	if c.Strategy.IntervalVolumeLookbackDays < 0 {
+		return errors.New("STRATEGY_INTERVAL_VOLUME_LOOKBACK_DAYS must be positive")
 	}
 	if err := c.validateWindows(); err != nil {
 		return err

@@ -111,6 +111,94 @@ func TestPlaceEntryReservesFreeOrderBudgetAtomically(t *testing.T) {
 	}
 }
 
+func TestPlaceEntryRequiresExitFreeOrderBudget(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	engine.SetMaxExitOrderAttempts(3)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: 3,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	_, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 1, book, 1, 1)
+	if !errors.Is(err, risk.ErrFreeOrderBudget) {
+		t.Fatalf("expected free order budget error, got %v", err)
+	}
+	if got := len(gateway.Orders); got != 0 {
+		t.Fatalf("broker orders=%d, want no post", got)
+	}
+}
+
+func TestPlaceEntryExitBudgetCountsFutureCancels(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	engine.SetMaxExitOrderAttempts(3)
+	engine.SetFreeOrderCountPolicy(FreeOrderPolicyCancelCounts)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: 5,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	_, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 1, book, 1, 1)
+	if !errors.Is(err, risk.ErrFreeOrderBudget) {
+		t.Fatalf("expected free order budget error, got %v", err)
+	}
+	if got := len(gateway.Orders); got != 0 {
+		t.Fatalf("broker orders=%d, want no post", got)
+	}
+}
+
+func TestPlaceEntryWithExitBudgetIncrementsOnlySubmittedEntry(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	gateway := tinvest.NewFakeGateway()
+	engine := NewEngine(domain.ModeSandbox, "account", gateway, repo)
+	engine.SetMaxExitOrderAttempts(3)
+	instrument := domain.Instrument{
+		InstrumentUID:        "uid",
+		Lot:                  1,
+		MinPriceIncrement:    decimal.NewFromInt(1),
+		FreeOrderLimitPerDay: 4,
+	}
+	book := domain.OrderBook{
+		InstrumentUID: "uid",
+		Bids:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(99), QuantityLots: 10}},
+		Asks:          []domain.OrderBookLevel{{Price: decimal.NewFromInt(101), QuantityLots: 10}},
+		ReceivedAt:    time.Now().UTC(),
+	}
+	tradeDate := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	if _, err := engine.PlaceEntry(ctx, "hash", instrument, tradeDate, 1, book, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := repo.GetFreeOrdersSent(ctx, tradeDate, "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 1 {
+		t.Fatalf("free order counter=%d, want only submitted entry counted", sent)
+	}
+}
+
 func TestPlaceEntryReleasesFreeOrderBudgetWhenBrokerRejects(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()

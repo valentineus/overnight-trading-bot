@@ -264,14 +264,21 @@ func (r *MemoryRepository) IncrementFreeOrders(_ context.Context, tradeDate time
 	return nil
 }
 
-func (r *MemoryRepository) ReserveFreeOrders(_ context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+func (r *MemoryRepository) ReserveFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error {
+	return r.ReserveFreeOrdersWithRequired(ctx, tradeDate, instrumentUID, delta, delta, limit)
+}
+
+func (r *MemoryRepository) ReserveFreeOrdersWithRequired(_ context.Context, tradeDate time.Time, instrumentUID string, delta int, required int, limit int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if delta <= 0 {
 		return nil
 	}
+	if required < delta {
+		required = delta
+	}
 	key := featureKey(instrumentUID, tradeDate)
-	if limit > 0 && r.FreeOrders[key]+delta > limit {
+	if limit > 0 && limit-r.FreeOrders[key] < required {
 		return risk.ErrFreeOrderBudget
 	}
 	r.FreeOrders[key] += delta

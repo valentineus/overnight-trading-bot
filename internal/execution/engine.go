@@ -37,6 +37,7 @@ type Engine struct {
 	store                repository.Repository
 	maxQuoteAge          time.Duration
 	freeOrderCountPolicy string
+	maxExitOrderAttempts int
 	clock                timeutil.Clock
 	mu                   sync.Map
 }
@@ -92,6 +93,12 @@ func (e *Engine) SetFreeOrderCountPolicy(policy string) {
 	}
 }
 
+func (e *Engine) SetMaxExitOrderAttempts(attempts int) {
+	if attempts > 0 {
+		e.maxExitOrderAttempts = attempts
+	}
+}
+
 func (e *Engine) PlaceEntry(ctx context.Context, accountIDHash string, instrument domain.Instrument, tradeDate time.Time, lots int64, book domain.OrderBook, improveTicks int, attempt int) (domain.Order, error) {
 	if err := e.checkQuoteFresh(book); err != nil {
 		return domain.Order{}, err
@@ -116,7 +123,7 @@ func (e *Engine) PlaceEntry(ctx context.Context, accountIDHash string, instrumen
 		Status:        domain.OrderStatusNew,
 		AttemptNo:     attempt,
 		RawStateJSON:  orderContextJSON(book),
-	}, instrument.FreeOrderLimitPerDay)
+	}, instrument.FreeOrderLimitPerDay, e.entryFreeOrderRequired())
 }
 
 func (e *Engine) PlaceExit(ctx context.Context, accountIDHash string, instrument domain.Instrument, tradeDate time.Time, lots int64, book domain.OrderBook, improveTicks int, attempt int) (domain.Order, error) {
@@ -143,14 +150,14 @@ func (e *Engine) PlaceExit(ctx context.Context, accountIDHash string, instrument
 		Status:        domain.OrderStatusNew,
 		AttemptNo:     attempt,
 		RawStateJSON:  orderContextJSON(book),
-	}, instrument.FreeOrderLimitPerDay)
+	}, instrument.FreeOrderLimitPerDay, 1)
 }
 
 func (e *Engine) PlaceLimit(ctx context.Context, order domain.Order) (domain.Order, error) {
-	return e.placeLimit(ctx, order, 0)
+	return e.placeLimit(ctx, order, 0, 1)
 }
 
-func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLimit int) (domain.Order, error) {
+func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLimit int, freeOrdersRequired int) (domain.Order, error) {
 	lock := e.lockFor(order.InstrumentUID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -183,7 +190,7 @@ func (e *Engine) placeLimit(ctx context.Context, order domain.Order, freeOrderLi
 			if err := repo.UpsertOrder(ctx, draft); err != nil {
 				return fmt.Errorf("persist draft order: %w", err)
 			}
-			return repo.ReserveFreeOrders(ctx, order.TradeDate, order.InstrumentUID, 1, freeOrderLimit)
+			return repo.ReserveFreeOrdersWithRequired(ctx, order.TradeDate, order.InstrumentUID, 1, freeOrdersRequired, freeOrderLimit)
 		}); err != nil {
 			return domain.Order{}, err
 		}
@@ -585,6 +592,25 @@ func (e *Engine) ensureRepostBudget(ctx context.Context, order domain.Order, ins
 		return fmt.Errorf("%w: %s remaining=%d needed=%d", risk.ErrFreeOrderBudget, instrument.InstrumentUID, remaining, needed)
 	}
 	return nil
+}
+
+func (e *Engine) entryFreeOrderRequired() int {
+	required := 1
+	if e.maxExitOrderAttempts <= 0 {
+		return required
+	}
+	return required + e.orderBudgetNeededForAttempts(e.maxExitOrderAttempts)
+}
+
+func (e *Engine) orderBudgetNeededForAttempts(attempts int) int {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	needed := attempts
+	if e.cancelCountsAsFreeOrder() {
+		needed += attempts - 1
+	}
+	return needed
 }
 
 func (e *Engine) cancelCountsAsFreeOrder() bool {

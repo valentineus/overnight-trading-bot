@@ -39,6 +39,13 @@ func (g *PaperGateway) GetCandles(ctx context.Context, instrumentUID string, int
 	return g.Fake().GetCandles(ctx, instrumentUID, interval, from, to)
 }
 
+func (g *PaperGateway) GetTradingDays(ctx context.Context, exchange string, from, to time.Time) ([]time.Time, error) {
+	if g.market != nil {
+		return g.market.GetTradingDays(ctx, exchange, from, to)
+	}
+	return g.Fake().GetTradingDays(ctx, exchange, from, to)
+}
+
 func (g *PaperGateway) GetOrderBook(ctx context.Context, instrumentUID string, depth int32) (domain.OrderBook, error) {
 	if g.market != nil {
 		return g.market.GetOrderBook(ctx, instrumentUID, depth)

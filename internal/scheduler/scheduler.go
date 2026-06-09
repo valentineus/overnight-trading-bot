@@ -29,42 +29,40 @@ import (
 	"overnight-trading-bot/internal/tinvest"
 )
 
-const (
-	sizeReductionWindowTrades  = 20
-	sizeReductionFactor        = 0.5
-	sizeReductionTriggerBps    = -10
-	intervalVolumeLookbackDays = 20
-)
-
 type Config struct {
-	Mode                   domain.Mode
-	Location               *time.Location
-	RollingLong            int
-	TickInterval           time.Duration
-	EntrySignalTime        timeutil.TimeOfDay
-	EntryWindowStart       timeutil.TimeOfDay
-	EntryWindowEnd         timeutil.TimeOfDay
-	NoNewEntryAfter        timeutil.TimeOfDay
-	ExitWatchStart         timeutil.TimeOfDay
-	ExitNotBefore          timeutil.TimeOfDay
-	ExitWindowStart        timeutil.TimeOfDay
-	ExitWindowEnd          timeutil.TimeOfDay
-	HardExitDeadline       timeutil.TimeOfDay
-	MarketClose            timeutil.TimeOfDay
-	QuoteDepth             int32
-	MaxQuoteAge            time.Duration
-	OrderPollInterval      time.Duration
-	PassiveImproveTicks    int
-	MaxEntryOrderAttempts  int
-	MaxExitOrderAttempts   int
-	MinTimeToClose         time.Duration
-	MaxClockDrift          time.Duration
-	APIOutageHalt          time.Duration
-	RequireZeroCommission  bool
-	QuarantineOnNonZero    bool
-	FreeOrderCountPolicy   string
-	ReconciliationInterval time.Duration
-	MaxOpenPositions       int
+	Mode                       domain.Mode
+	Location                   *time.Location
+	RollingLong                int
+	IntervalVolumeLookbackDays int
+	TickInterval               time.Duration
+	EntrySignalTime            timeutil.TimeOfDay
+	EntryWindowStart           timeutil.TimeOfDay
+	EntryWindowEnd             timeutil.TimeOfDay
+	NoNewEntryAfter            timeutil.TimeOfDay
+	ExitWatchStart             timeutil.TimeOfDay
+	ExitNotBefore              timeutil.TimeOfDay
+	ExitWindowStart            timeutil.TimeOfDay
+	ExitWindowEnd              timeutil.TimeOfDay
+	HardExitDeadline           timeutil.TimeOfDay
+	MarketClose                timeutil.TimeOfDay
+	QuoteDepth                 int32
+	MaxQuoteAge                time.Duration
+	OrderPollInterval          time.Duration
+	PassiveImproveTicks        int
+	MaxEntryOrderAttempts      int
+	MaxExitOrderAttempts       int
+	MinTimeToClose             time.Duration
+	MaxClockDrift              time.Duration
+	APIOutageHalt              time.Duration
+	RequireZeroCommission      bool
+	QuarantineOnNonZero        bool
+	FreeOrderCountPolicy       string
+	ReconciliationInterval     time.Duration
+	MaxOpenPositions           int
+	SizeReductionWindowTrades  int
+	SizeReductionFactor        decimal.Decimal
+	SizeReductionTriggerBps    decimal.Decimal
+	TradingCalendarExchange    string
 }
 
 type Services struct {
@@ -112,6 +110,21 @@ func New(clock timeutil.Clock, sm statemachine.System, cfg Config, svc Services)
 	}
 	if cfg.ReconciliationInterval <= 0 {
 		cfg.ReconciliationInterval = 5 * time.Minute
+	}
+	if cfg.IntervalVolumeLookbackDays <= 0 {
+		cfg.IntervalVolumeLookbackDays = 20
+	}
+	if cfg.SizeReductionWindowTrades <= 0 {
+		cfg.SizeReductionWindowTrades = 20
+	}
+	if !cfg.SizeReductionFactor.IsPositive() {
+		cfg.SizeReductionFactor = decimal.RequireFromString("0.5")
+	}
+	if cfg.SizeReductionTriggerBps.IsZero() {
+		cfg.SizeReductionTriggerBps = decimal.NewFromInt(-10)
+	}
+	if cfg.TradingCalendarExchange == "" {
+		cfg.TradingCalendarExchange = "MOEX"
 	}
 	return Scheduler{clock: clock, sm: sm, cfg: cfg, svc: svc}
 }
@@ -234,10 +247,16 @@ func (s *Scheduler) prepareSignals(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if err := s.svc.MarketData.BackfillDaily(ctx, instrumentsList, tradeDate.AddDate(0, 0, -s.cfg.RollingLong-10), tradeDate); err != nil {
+	dailyFrom := tradeDate.AddDate(0, 0, -s.cfg.RollingLong-10)
+	if err := s.svc.MarketData.BackfillDaily(ctx, instrumentsList, dailyFrom, tradeDate); err != nil {
 		return err
 	}
-	minuteFrom := s.cfg.EntryWindowStart.On(tradeDate.AddDate(0, 0, -intervalVolumeLookbackDays), s.cfg.Location)
+	tradingDays, err := s.svc.Gateway.GetTradingDays(ctx, s.cfg.TradingCalendarExchange, dailyFrom, tradeDate)
+	if err != nil {
+		return fmt.Errorf("load trading calendar %s: %w", s.cfg.TradingCalendarExchange, err)
+	}
+	s.svc.Features = s.svc.Features.WithTradingDays(tradingDays)
+	minuteFrom := s.cfg.EntryWindowStart.On(tradeDate.AddDate(0, 0, -s.cfg.IntervalVolumeLookbackDays), s.cfg.Location)
 	minuteTo := s.cfg.ExitWindowEnd.On(tradeDate, s.cfg.Location)
 	if err := s.svc.MarketData.BackfillMinute(ctx, instrumentsList, minuteFrom, minuteTo); err != nil {
 		s.logWarn("minute backfill failed; liquidity will fall back to ADV", "err", err)
@@ -904,15 +923,17 @@ func (s *Scheduler) sendDailyReport(ctx context.Context, now time.Time, riskStat
 }
 
 func (s *Scheduler) applySizeReductionRule(ctx context.Context, tradeDate time.Time, emitEvent bool) error {
-	averageError, count, ok, err := s.averageExpectedErrorBps(ctx, tradeDate, sizeReductionWindowTrades)
+	window := s.sizeReductionWindowTrades()
+	trigger := s.sizeReductionTriggerBps()
+	averageError, count, ok, err := s.averageExpectedErrorBps(ctx, tradeDate, window)
 	if err != nil {
 		return err
 	}
-	if !ok || count < sizeReductionWindowTrades || averageError.GreaterThanOrEqual(decimal.NewFromInt(sizeReductionTriggerBps)) {
+	if !ok || count < window || averageError.GreaterThanOrEqual(trigger) {
 		s.svc.Sizer = s.svc.Sizer.WithSizeFactor(decimal.NewFromInt(1))
 		return nil
 	}
-	factor := decimal.NewFromFloat(sizeReductionFactor)
+	factor := s.sizeReductionFactor()
 	s.svc.Sizer = s.svc.Sizer.WithSizeFactor(factor)
 	if emitEvent {
 		if err := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
@@ -1438,11 +1459,13 @@ func (s *Scheduler) handleLiveReadonlyAfterSizeReduction(ctx context.Context, tr
 	if s.cfg.Mode != domain.ModeLiveTrade {
 		return nil
 	}
-	previousAverage, previousCount, previousOK, err := s.averageExpectedErrorBpsWindow(ctx, tradeDate, sizeReductionWindowTrades, sizeReductionWindowTrades)
+	window := s.sizeReductionWindowTrades()
+	trigger := s.sizeReductionTriggerBps()
+	previousAverage, previousCount, previousOK, err := s.averageExpectedErrorBpsWindow(ctx, tradeDate, window, window)
 	if err != nil {
 		return err
 	}
-	if previousOK && previousCount == sizeReductionWindowTrades && previousAverage.LessThan(decimal.NewFromInt(sizeReductionTriggerBps)) {
+	if previousOK && previousCount == window && previousAverage.LessThan(trigger) {
 		return s.activateLiveReadonly(ctx, averageError, count, previousAverage, previousCount, factor)
 	}
 	if !emitRecommendation {
@@ -1466,9 +1489,9 @@ func (s *Scheduler) activateLiveReadonly(ctx context.Context, averageError decim
 		return nil
 	}
 	message := fmt.Sprintf(
-		"average expected_error_bps stayed below %d for two consecutive %d-trade windows; switching to live_readonly",
-		sizeReductionTriggerBps,
-		sizeReductionWindowTrades,
+		"average expected_error_bps stayed below %s for two consecutive %d-trade windows; switching to live_readonly",
+		s.sizeReductionTriggerBps().String(),
+		s.sizeReductionWindowTrades(),
 	)
 	s.cfg.Mode = domain.ModeLiveReadonly
 	if s.svc.Execution != nil {
@@ -1561,6 +1584,27 @@ func (s Scheduler) maxOrderAttemptsPerTrade() int {
 		return 1
 	}
 	return needed
+}
+
+func (s Scheduler) sizeReductionWindowTrades() int {
+	if s.cfg.SizeReductionWindowTrades <= 0 {
+		return 20
+	}
+	return s.cfg.SizeReductionWindowTrades
+}
+
+func (s Scheduler) sizeReductionFactor() decimal.Decimal {
+	if !s.cfg.SizeReductionFactor.IsPositive() {
+		return decimal.RequireFromString("0.5")
+	}
+	return s.cfg.SizeReductionFactor
+}
+
+func (s Scheduler) sizeReductionTriggerBps() decimal.Decimal {
+	if s.cfg.SizeReductionTriggerBps.IsZero() {
+		return decimal.NewFromInt(-10)
+	}
+	return s.cfg.SizeReductionTriggerBps
 }
 
 func (s Scheduler) orderBudgetNeededForAttempts(attempts int) int {

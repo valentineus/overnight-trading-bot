@@ -34,6 +34,12 @@ type SDKLogger struct {
 	Logger *slog.Logger
 }
 
+type NoopSDKLogger struct{}
+
+func NewSDKLogger(logger *slog.Logger) SDKLogger {
+	return SDKLogger{Logger: logger}
+}
+
 func (l SDKLogger) Infof(template string, args ...any) {
 	if l.Logger != nil {
 		l.Logger.Info(RedactString(template), "args", redactArgs(args))
@@ -51,6 +57,10 @@ func (l SDKLogger) Fatalf(template string, args ...any) {
 		l.Logger.Error(RedactString(template), "args", redactArgs(args))
 	}
 }
+
+func (NoopSDKLogger) Infof(string, ...any)  {}
+func (NoopSDKLogger) Errorf(string, ...any) {}
+func (NoopSDKLogger) Fatalf(string, ...any) {}
 
 var sensitiveStringPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)((?:account[_-]?id|token)\s*[:=]\s*)("[^"]+"|'[^']+'|[^\s,}]+)`),

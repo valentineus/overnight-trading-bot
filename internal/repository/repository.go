@@ -39,6 +39,7 @@ type Repository interface {
 	GetFreeOrdersSent(ctx context.Context, tradeDate time.Time, instrumentUID string) (int, error)
 	IncrementFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int) error
 	ReserveFreeOrders(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, limit int) error
+	ReserveFreeOrdersWithRequired(ctx context.Context, tradeDate time.Time, instrumentUID string, delta int, required int, limit int) error
 
 	GetSystemState(ctx context.Context) (domain.SystemState, bool, string, error)
 	SaveSystemState(ctx context.Context, state domain.SystemState, mode domain.Mode, halted bool, reason string, contextJSON string) error
