@@ -64,7 +64,7 @@ Common formats:
 | `TINVEST_RETRY_COUNT` | `3` | Number of T-Invest SDK attempts. |
 | `TINVEST_RETRY_BACKOFF_SEC` | `2` | Initial exponential backoff in seconds. |
 | `TINVEST_USE_SANDBOX` | `false` | Compatibility guard; valid only with `APP_MODE=sandbox`. |
-| `TINVEST_TRADING_CALENDAR_EXCHANGE` | `MOEX` | Exchange calendar used to load trading days. |
+| `TINVEST_TRADING_CALENDAR_EXCHANGE` | `MOEX` | Deprecated compatibility setting; historical feature calendars are derived from loaded daily candles. |
 
 ### DB
 

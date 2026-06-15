@@ -251,9 +251,9 @@ func (s *Scheduler) prepareSignals(ctx context.Context, now time.Time) error {
 	if err := s.svc.MarketData.BackfillDaily(ctx, instrumentsList, dailyFrom, tradeDate); err != nil {
 		return err
 	}
-	tradingDays, err := s.svc.Gateway.GetTradingDays(ctx, s.cfg.TradingCalendarExchange, dailyFrom, tradeDate)
+	tradingDays, err := s.tradingDaysFromDailyCandles(ctx, instrumentsList, dailyFrom, tradeDate.AddDate(0, 0, -1))
 	if err != nil {
-		return fmt.Errorf("load trading calendar %s: %w", s.cfg.TradingCalendarExchange, err)
+		return err
 	}
 	s.svc.Features = s.svc.Features.WithTradingDays(tradingDays)
 	minuteFrom := s.cfg.EntryWindowStart.On(tradeDate.AddDate(0, 0, -s.cfg.IntervalVolumeLookbackDays), s.cfg.Location)
@@ -295,6 +295,33 @@ func (s *Scheduler) prepareSignals(ctx context.Context, now time.Time) error {
 		}
 	}
 	return s.transitionTo(ctx, domain.StateWaitEntryWindow)
+}
+
+func (s Scheduler) tradingDaysFromDailyCandles(ctx context.Context, instrumentsList []domain.Instrument, from, to time.Time) ([]time.Time, error) {
+	if to.Before(from) {
+		return nil, nil
+	}
+	seen := make(map[time.Time]struct{})
+	for _, instrument := range instrumentsList {
+		if !instrument.Enabled || instrument.Quarantine {
+			continue
+		}
+		candles, err := s.svc.Repo.ListDailyCandles(ctx, instrument.InstrumentUID, from, to)
+		if err != nil {
+			return nil, fmt.Errorf("load daily candles for trading calendar %s: %w", instrument.Ticker, err)
+		}
+		for _, candle := range candles {
+			seen[tradingDate(candle.TradeDate)] = struct{}{}
+		}
+	}
+	days := make([]time.Time, 0, len(seen))
+	for day := range seen {
+		days = append(days, day)
+	}
+	sort.Slice(days, func(i, j int) bool {
+		return days[i].Before(days[j])
+	})
+	return days, nil
 }
 
 func (s Scheduler) generateInstrumentSignal(ctx context.Context, tradeDate time.Time, openPositionCount int, instrument domain.Instrument) (signalCandidate, error) {
