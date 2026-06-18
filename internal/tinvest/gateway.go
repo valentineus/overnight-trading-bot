@@ -43,6 +43,7 @@ type FakeGateway struct {
 	Portfolio        domain.Portfolio
 	Operations       []domain.Operation
 	ServerTime       time.Time
+	ServerTimeError  error
 }
 
 func NewFakeGateway() *FakeGateway {
@@ -239,6 +240,9 @@ func (f *FakeGateway) GetOperations(_ context.Context, _ string, from, to time.T
 func (f *FakeGateway) GetServerTime(context.Context) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.ServerTimeError != nil {
+		return time.Time{}, f.ServerTimeError
+	}
 	if f.ServerTime.IsZero() {
 		return time.Now().UTC(), nil
 	}

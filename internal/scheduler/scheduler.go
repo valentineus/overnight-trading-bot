@@ -1061,7 +1061,7 @@ func (s *Scheduler) recordInfrastructureFailure(ctx context.Context, err error) 
 	now := s.nowUTC()
 	if s.infraFailedSince.IsZero() {
 		s.infraFailedSince = now
-		s.logWarn("infrastructure check failed; waiting for outage threshold", "err", err, "threshold", s.cfg.APIOutageHalt)
+		s.logWarn("infrastructure check failed; pausing scheduler step", "err", err, "threshold", s.cfg.APIOutageHalt)
 		if s.svc.Repo != nil {
 			if insertErr := s.svc.Repo.InsertRiskEvent(ctx, domain.RiskEvent{
 				TS:          now,
@@ -1075,10 +1075,12 @@ func (s *Scheduler) recordInfrastructureFailure(ctx context.Context, err error) 
 		}
 		return nil
 	}
-	if s.cfg.APIOutageHalt <= 0 || now.Sub(s.infraFailedSince) >= s.cfg.APIOutageHalt {
-		return err
+	elapsed := now.Sub(s.infraFailedSince)
+	if s.cfg.APIOutageHalt > 0 && elapsed >= s.cfg.APIOutageHalt {
+		s.logWarn("infrastructure check still failing after outage threshold; continuing soft pause", "err", err, "elapsed", elapsed, "threshold", s.cfg.APIOutageHalt)
+		return nil
 	}
-	s.logWarn("infrastructure check still failing", "err", err, "elapsed", now.Sub(s.infraFailedSince), "threshold", s.cfg.APIOutageHalt)
+	s.logWarn("infrastructure check still failing; pausing scheduler step", "err", err, "elapsed", elapsed, "threshold", s.cfg.APIOutageHalt)
 	return nil
 }
 
@@ -1397,7 +1399,6 @@ func (s Scheduler) unknownBrokerState(ctx context.Context, portfolio domain.Port
 func isHardHaltPreTradeReason(reason string) bool {
 	switch reason {
 	case "database_unavailable",
-		"server_time_unavailable",
 		"server_clock_drift_too_high",
 		"unknown_broker_order",
 		"unknown_broker_position",

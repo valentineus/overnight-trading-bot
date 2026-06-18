@@ -115,6 +115,55 @@ func TestClockDriftHardLimitHaltsImmediately(t *testing.T) {
 	}
 }
 
+func TestServerTimeUnavailableSoftPausesAfterOutageThreshold(t *testing.T) {
+	ctx := context.Background()
+	gateway := tinvest.NewFakeGateway()
+	gateway.ServerTimeError = context.DeadlineExceeded
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 18, 9, 0, 0, 0, time.UTC)
+	s := &Scheduler{
+		clock: fixedClock{now: now},
+		cfg: Config{
+			Mode:          domain.ModeSandbox,
+			MaxClockDrift: 2 * time.Second,
+			APIOutageHalt: 180 * time.Second,
+		},
+		svc: Services{
+			Repo:     repo,
+			Gateway:  gateway,
+			Risk:     risk.NewManager(repo, risk.ManagerConfig{}),
+			Notifier: &countNotifier{},
+		},
+	}
+
+	if err := s.checkInfrastructure(ctx); err != nil {
+		t.Fatalf("first infrastructure check err=%v, want soft pause", err)
+	}
+	if repo.Halted {
+		t.Fatalf("system halted on first server time outage: reason=%q", repo.HaltReason)
+	}
+	if len(repo.RiskEvents) != 1 || repo.RiskEvents[0].EventType != "infrastructure_outage_started" {
+		t.Fatalf("risk events=%+v", repo.RiskEvents)
+	}
+
+	s.clock = fixedClock{now: now.Add(5 * time.Minute)}
+	if err := s.checkInfrastructure(ctx); err != nil {
+		t.Fatalf("post-threshold infrastructure check err=%v, want soft pause", err)
+	}
+	if repo.Halted {
+		t.Fatalf("system halted after server time outage threshold: reason=%q", repo.HaltReason)
+	}
+
+	gateway.ServerTimeError = nil
+	gateway.ServerTime = now.Add(5 * time.Minute)
+	if err := s.checkInfrastructure(ctx); err != nil {
+		t.Fatalf("recovered infrastructure check err=%v", err)
+	}
+	if !s.infraFailedSince.IsZero() {
+		t.Fatalf("infraFailedSince=%s, want zero after recovery", s.infraFailedSince)
+	}
+}
+
 func TestStepIsIdempotentAfterSignalPreparation(t *testing.T) {
 	ctx := context.Background()
 	repo := testutil.NewMemoryRepository()
@@ -599,6 +648,45 @@ func TestPreTradeClockDriftBreachHalts(t *testing.T) {
 	}
 	if notifier.alerts != 1 {
 		t.Fatalf("alerts=%d, want 1", notifier.alerts)
+	}
+}
+
+func TestPreTradeServerTimeUnavailableRejectsWithoutHalting(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewMemoryRepository()
+	now := time.Date(2026, 6, 8, 18, 20, 0, 0, time.UTC)
+	gateway := tinvest.NewFakeGateway()
+	gateway.ServerTimeError = context.DeadlineExceeded
+	notifier := &countNotifier{}
+	s := Scheduler{
+		cfg: Config{
+			Mode:          domain.ModeSandbox,
+			Location:      time.UTC,
+			MaxClockDrift: 2 * time.Second,
+		},
+		svc: Services{
+			Repo:          repo,
+			Gateway:       gateway,
+			Risk:          risk.NewManager(repo, risk.ManagerConfig{}),
+			Notifier:      notifier,
+			AccountIDHash: "hash",
+		},
+	}
+	result, err := s.preTradeCheck(ctx, now, "uid", domain.Portfolio{
+		Equity: decimal.NewFromInt(10000),
+		Cash:   decimal.NewFromInt(10000),
+	}, 0, false, domain.TradingStatusNormal, now)
+	if err != nil {
+		t.Fatalf("err=%v, want reject without hard halt error", err)
+	}
+	if result.Allowed || result.Reason != "server_time_unavailable" {
+		t.Fatalf("result=%+v, want server_time_unavailable reject", result)
+	}
+	if repo.Halted || repo.HaltReason != "" {
+		t.Fatalf("halted=%v reason=%q, want no halt", repo.Halted, repo.HaltReason)
+	}
+	if notifier.alerts != 0 {
+		t.Fatalf("alerts=%d, want 0", notifier.alerts)
 	}
 }
 
