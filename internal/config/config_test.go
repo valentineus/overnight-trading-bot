@@ -86,6 +86,39 @@ func TestLoadSchedulerKnobsFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadTelegramQueueDefaults(t *testing.T) {
+	t.Setenv("APP_MODE", "backtest")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Telegram.RequestTimeoutSec != 10 {
+		t.Fatalf("telegram request timeout=%d, want 10", cfg.Telegram.RequestTimeoutSec)
+	}
+	if cfg.Telegram.QueueSize != 256 {
+		t.Fatalf("telegram queue size=%d, want 256", cfg.Telegram.QueueSize)
+	}
+}
+
+func TestValidateRejectsInvalidTelegramRequestTimeout(t *testing.T) {
+	cfg := minimalBrokerConfig(domain.ModeSandbox)
+	cfg.Telegram.RequestTimeoutSec = 0
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "TELEGRAM_REQUEST_TIMEOUT_SEC") {
+		t.Fatalf("Validate err=%v, want TELEGRAM_REQUEST_TIMEOUT_SEC requirement", err)
+	}
+}
+
+func TestValidateRejectsInvalidTelegramQueueSize(t *testing.T) {
+	cfg := minimalBrokerConfig(domain.ModeSandbox)
+	cfg.Telegram.QueueSize = 0
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "TELEGRAM_QUEUE_SIZE") {
+		t.Fatalf("Validate err=%v, want TELEGRAM_QUEUE_SIZE requirement", err)
+	}
+}
+
 func minimalBrokerConfig(mode domain.Mode) Config {
 	return Config{
 		App: AppConfig{
@@ -99,6 +132,10 @@ func minimalBrokerConfig(mode domain.Mode) Config {
 			RequestTimeoutSec: 10,
 		},
 		DB: DBConfig{DSN: "user:pass@tcp(localhost:3306)/bot"},
+		Telegram: TelegramConfig{
+			RequestTimeoutSec: 10,
+			QueueSize:         256,
+		},
 		Execution: ExecutionConfig{
 			EntrySignalTime:     mustTOD("18:10:00"),
 			EntryWindowStart:    mustTOD("18:20:00"),

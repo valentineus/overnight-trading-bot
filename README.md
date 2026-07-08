@@ -86,6 +86,8 @@ Common formats:
 | `TELEGRAM_NOTIFY_WARN` | `true` | Send warnings. |
 | `TELEGRAM_NOTIFY_ALERT` | `true` | Send critical alerts. |
 | `TELEGRAM_NOTIFY_REPORT` | `true` | Send daily reports. |
+| `TELEGRAM_REQUEST_TIMEOUT_SEC` | `10` | HTTP timeout for Telegram API calls, including the startup `getMe` check and message sends. |
+| `TELEGRAM_QUEUE_SIZE` | `256` | In-memory Telegram notification queue size. The queue smooths transient Telegram slowness but is not persisted across process restarts. |
 
 ### STRATEGY
 

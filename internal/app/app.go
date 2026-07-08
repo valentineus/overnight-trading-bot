@@ -172,13 +172,15 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	notifier, err := notify.NewTelegram(notify.TelegramConfig{
-		BotToken:     cfg.Telegram.BotToken,
-		ChatID:       cfg.Telegram.ChatID,
-		NotifyInfo:   cfg.Telegram.NotifyInfo,
-		NotifyWarn:   cfg.Telegram.NotifyWarn,
-		NotifyAlert:  cfg.Telegram.NotifyAlert,
-		NotifyReport: cfg.Telegram.NotifyReport,
-		AuditSink:    repo,
+		BotToken:       cfg.Telegram.BotToken,
+		ChatID:         cfg.Telegram.ChatID,
+		NotifyInfo:     cfg.Telegram.NotifyInfo,
+		NotifyWarn:     cfg.Telegram.NotifyWarn,
+		NotifyAlert:    cfg.Telegram.NotifyAlert,
+		NotifyReport:   cfg.Telegram.NotifyReport,
+		RequestTimeout: time.Duration(cfg.Telegram.RequestTimeoutSec) * time.Second,
+		QueueSize:      cfg.Telegram.QueueSize,
+		AuditSink:      repo,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("create notifier: %w", err)

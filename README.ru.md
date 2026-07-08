@@ -77,6 +77,8 @@ APP_MODE=backtest go run ./cmd/bot
 | `TELEGRAM_NOTIFY_WARN` | `true` или `false` | `true` | boolean | Включает предупреждения. |
 | `TELEGRAM_NOTIFY_ALERT` | `true` или `false` | `true` | boolean | Включает alert-сообщения. Они считаются критичными для доставки и ждут место в очереди. |
 | `TELEGRAM_NOTIFY_REPORT` | `true` или `false` | `true` | boolean | Включает дневные отчёты. |
+| `TELEGRAM_REQUEST_TIMEOUT_SEC` | целое число секунд | `10` | должно быть `> 0` | Таймаут HTTP-запросов к Telegram API, включая стартовую проверку `getMe` и отправку сообщений. |
+| `TELEGRAM_QUEUE_SIZE` | целое число | `256` | должно быть `> 0` | Размер in-memory очереди Telegram-уведомлений. Очередь сглаживает временную медленную доставку, но не сохраняется между рестартами процесса. |
 
 ### STRATEGY
 

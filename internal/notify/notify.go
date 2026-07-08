@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -13,7 +14,11 @@ import (
 	"overnight-trading-bot/internal/domain"
 )
 
-const mustDeliverEnqueueTimeout = 2 * time.Second
+const (
+	defaultQueueSize          = 256
+	defaultRequestTimeout     = 10 * time.Second
+	mustDeliverEnqueueTimeout = 2 * time.Second
+)
 
 type Notifier interface {
 	Info(ctx context.Context, msg string) error
@@ -32,13 +37,15 @@ func (Noop) Report(context.Context, string) error { return nil }
 func (Noop) Close() error                         { return nil }
 
 type TelegramConfig struct {
-	BotToken     string
-	ChatID       int64
-	NotifyInfo   bool
-	NotifyWarn   bool
-	NotifyAlert  bool
-	NotifyReport bool
-	AuditSink    AuditSink
+	BotToken       string
+	ChatID         int64
+	NotifyInfo     bool
+	NotifyWarn     bool
+	NotifyAlert    bool
+	NotifyReport   bool
+	RequestTimeout time.Duration
+	QueueSize      int
+	AuditSink      AuditSink
 }
 
 type AuditSink interface {
@@ -46,12 +53,13 @@ type AuditSink interface {
 }
 
 type Telegram struct {
-	cfg    TelegramConfig
-	bot    *tgbotapi.BotAPI
-	log    *slog.Logger
-	queue  chan outbound
-	done   chan struct{}
-	closed chan struct{}
+	cfg        TelegramConfig
+	bot        *tgbotapi.BotAPI
+	log        *slog.Logger
+	queue      chan outbound
+	done       chan struct{}
+	closed     chan struct{}
+	retryDelay func(error, int) time.Duration
 }
 
 type outbound struct {
@@ -61,23 +69,34 @@ type outbound struct {
 }
 
 func NewTelegram(cfg TelegramConfig, log *slog.Logger) (Notifier, error) {
+	return newTelegramWithEndpoint(cfg, log, tgbotapi.APIEndpoint)
+}
+
+func newTelegramWithEndpoint(cfg TelegramConfig, log *slog.Logger, apiEndpoint string) (Notifier, error) {
 	if cfg.BotToken == "" || cfg.ChatID == 0 {
 		if log != nil {
 			log.Warn("telegram notifier disabled; TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty")
 		}
 		return Noop{}, nil
 	}
-	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = defaultRequestTimeout
+	}
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = defaultQueueSize
+	}
+	bot, err := tgbotapi.NewBotAPIWithClient(cfg.BotToken, apiEndpoint, &http.Client{Timeout: cfg.RequestTimeout})
 	if err != nil {
 		return nil, err
 	}
 	t := &Telegram{
-		cfg:    cfg,
-		bot:    bot,
-		log:    log,
-		queue:  make(chan outbound, 256),
-		done:   make(chan struct{}),
-		closed: make(chan struct{}),
+		cfg:        cfg,
+		bot:        bot,
+		log:        log,
+		queue:      make(chan outbound, cfg.QueueSize),
+		done:       make(chan struct{}),
+		closed:     make(chan struct{}),
+		retryDelay: telegramRetryDelay,
 	}
 	go t.dispatch()
 	return t, nil
@@ -181,7 +200,7 @@ func (t *Telegram) send(item outbound) {
 	for attempt := 0; attempt < 3; attempt++ {
 		if _, err := t.bot.Send(msg); err != nil {
 			lastErr = err
-			delay := telegramRetryDelay(err, attempt)
+			delay := t.retryDelay(err, attempt)
 			if t.log != nil {
 				t.log.Warn("telegram send failed", "attempt", attempt+1, "err", err, "retry_in", delay)
 			}

@@ -66,12 +66,14 @@ type DBConfig struct {
 }
 
 type TelegramConfig struct {
-	BotToken     string `env:"BOT_TOKEN"`
-	ChatID       int64  `env:"CHAT_ID"`
-	NotifyInfo   bool   `env:"NOTIFY_INFO" envDefault:"true"`
-	NotifyWarn   bool   `env:"NOTIFY_WARN" envDefault:"true"`
-	NotifyAlert  bool   `env:"NOTIFY_ALERT" envDefault:"true"`
-	NotifyReport bool   `env:"NOTIFY_REPORT" envDefault:"true"`
+	BotToken          string `env:"BOT_TOKEN"`
+	ChatID            int64  `env:"CHAT_ID"`
+	NotifyInfo        bool   `env:"NOTIFY_INFO" envDefault:"true"`
+	NotifyWarn        bool   `env:"NOTIFY_WARN" envDefault:"true"`
+	NotifyAlert       bool   `env:"NOTIFY_ALERT" envDefault:"true"`
+	NotifyReport      bool   `env:"NOTIFY_REPORT" envDefault:"true"`
+	RequestTimeoutSec int    `env:"REQUEST_TIMEOUT_SEC" envDefault:"10"`
+	QueueSize         int    `env:"QUEUE_SIZE" envDefault:"256"`
 }
 
 type StrategyConfig struct {
@@ -200,6 +202,12 @@ func (c *Config) Validate() error {
 	}
 	if c.TInvest.RequestTimeoutSec <= 0 {
 		return errors.New("TINVEST_REQUEST_TIMEOUT_SEC must be positive")
+	}
+	if c.Telegram.RequestTimeoutSec <= 0 {
+		return errors.New("TELEGRAM_REQUEST_TIMEOUT_SEC must be positive")
+	}
+	if c.Telegram.QueueSize <= 0 {
+		return errors.New("TELEGRAM_QUEUE_SIZE must be positive")
 	}
 	if c.TInvest.TradingCalendarExchange == "" {
 		c.TInvest.TradingCalendarExchange = "MOEX"
