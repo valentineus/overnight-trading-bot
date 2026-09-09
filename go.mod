@@ -7,7 +7,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
-	github.com/golang-migrate/migrate/v4 v4.19.1
+	github.com/golang-migrate/migrate/v4 v4.20.0
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/russianinvestments/invest-api-go-sdk v1.40.1
 	github.com/shopspring/decimal v1.4.0
