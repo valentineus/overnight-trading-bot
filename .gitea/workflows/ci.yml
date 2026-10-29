@@ -1,0 +1,64 @@
+name: Test and build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+env:
+  GOLANGCI_LINT_VERSION: v2.12.2
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Print Go version
+        run: go version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+      - name: Build linux/amd64 binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -Eeuo pipefail
+          mkdir -p out/bin
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o out/bin/overnight-trading-bot ./cmd/bot
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o out/bin/overnight-trading-bot-migrate ./cmd/migrate
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o out/bin/overnight-trading-bot-backtest ./cmd/backtest
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o out/bin/overnight-trading-bot-mode-days ./cmd/mode-days
