@@ -86,7 +86,11 @@ func TestNewTelegramUsesConfiguredQueueSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer notifier.Close()
+	defer func() {
+		if err := notifier.Close(); err != nil {
+			t.Errorf("close notifier: %v", err)
+		}
+	}()
 
 	telegram, ok := notifier.(*Telegram)
 	if !ok {
@@ -122,7 +126,11 @@ func TestTelegramSendTimeoutAuditsMustDeliverFailure(t *testing.T) {
 	}
 	telegram := notifier.(*Telegram)
 	telegram.retryDelay = func(error, int) time.Duration { return time.Millisecond }
-	defer notifier.Close()
+	defer func() {
+		if err := notifier.Close(); err != nil {
+			t.Errorf("close notifier: %v", err)
+		}
+	}()
 
 	if err := notifier.Alert(context.Background(), "critical"); err != nil {
 		t.Fatal(err)
