@@ -240,30 +240,6 @@ The minute model uses the same format, but `trade_date` may be a timestamp such 
 
 `ClientOrderID` is deterministic by `(date, instrument_uid, side, attempt)`, fits the T-Invest `order_id <= 36` limit, and contains a SHA-256 suffix to suppress duplicate broker orders after restarts.
 
-## Deploy
-
-The Gitea workflow builds static Linux binaries for `cmd/bot`, `cmd/migrate`, and `cmd/backtest`, ships them to the target host, installs the systemd unit from `deploy/systemd/overnight-trading-bot.service`, restarts the service, and verifies health with `overnight-trading-bot -healthcheck`.
-
-Required Gitea secrets:
-
-| Secret | Description |
-| --- | --- |
-| `secrets.DEPLOY_HOST` | Target host IP or DNS name. |
-| `secrets.DEPLOY_SSH_PRIVATE_KEY_BASE64` | Root deployment SSH private key encoded with `base64 -w0 < id_ed25519`. |
-
-Before the first deployment, create the production env file on the server:
-
-```sh
-install -d -m 0750 /etc/overnight-trading-bot
-install -m 0640 .env.example /etc/overnight-trading-bot/overnight-trading-bot.env
-```
-
-Then replace `DB_DSN` with the external database address and fill T-Invest/Telegram secrets. The service runs as the unprivileged `overnight-bot` user with basic systemd hardening. Logs are available through:
-
-```sh
-journalctl -u overnight-trading-bot.service
-```
-
 ## Runbook
 
 API unavailable in the morning:

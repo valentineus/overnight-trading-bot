@@ -228,35 +228,6 @@ TRUR,2024-01-09,100,101,99,100.5,10000,10,0.01
 
 `ClientOrderID` детерминирован по `(date, instrument_uid, side, attempt)`, укладывается в лимит T-Invest `order_id <= 36` и содержит SHA-256 suffix. При ручных массовых перезапусках с теми же параметрами id остаётся тем же, что намеренно подавляет дубли.
 
-## Deploy
-
-`.gitea/workflows/ci.yml` собирает статический бинарь и кладёт его на сервер. Никакого Docker/Podman ни в CI, ни на сервере не используется — служба запускается напрямую через `systemd` внутри LXC-контейнера. БД (MariaDB/MySQL) живёт на отдельном хосте и подключается через `DB_DSN`.
-
-Pipeline на push в `master` (один job `deploy`):
-
-1. `actions/setup-go@v5` (версия из `go.mod`), `go mod download`, `go vet ./...`, `go test ./...`.
-2. Кросс-компиляция `linux/amd64` с `CGO_ENABLED=0` и `-trimpath -ldflags="-s -w"` для `cmd/bot`, `cmd/migrate`, `cmd/backtest`. Бинари именуются `overnight-trading-bot`, `overnight-trading-bot-migrate`, `overnight-trading-bot-backtest` — чтобы безопасно жить в `/usr/local/bin`.
-3. Сборка `out/release.tar.gz` с бинарями и `deploy/systemd/overnight-trading-bot.service`.
-4. SSH-ключ из base64 → `~/.ssh/deploy_key`, `ssh-keyscan` целевого хоста.
-5. `scp` архива в `/var/tmp/overnight-trading-bot-deploy/release.tar.gz` на сервере.
-6. На сервере: проверка наличия env-файла, идемпотентное создание системного пользователя `overnight-bot`, распаковка во временный staging-каталог `/var/tmp/overnight-trading-bot-deploy/stage`, атомарная замена `/usr/local/bin/overnight-trading-bot{,-migrate,-backtest}` через `*.new` → `mv -f`, копирование systemd unit в `/etc/systemd/system/`, `systemctl daemon-reload && enable && restart`. После рестарта workflow ждёт `is-active` (до 60 с), затем проверяет `overnight-trading-bot -healthcheck` (до 30 с); при провале печатает последние 100 строк `journalctl` и завершается с ошибкой.
-
-Переменные Gitea:
-
-- `secrets.DEPLOY_HOST` - IP сервера.
-- `secrets.DEPLOY_SSH_PRIVATE_KEY_BASE64` - приватный SSH-ключ root в base64 (`base64 -w0 < id_ed25519`).
-
-На сервере (debian 13 LXC) заранее должны быть установлены `systemd` (и стандартные утилиты `tar`, `useradd`, `journalctl` — все из coreutils/util-linux/systemd, в базовом образе debian 13 уже есть). Перед первым деплоем нужно создать production env-файл:
-
-```sh
-install -d -m 0750 /etc/overnight-trading-bot
-install -m 0640 .env.example /etc/overnight-trading-bot/overnight-trading-bot.env
-```
-
-В `/etc/overnight-trading-bot/overnight-trading-bot.env` нужно заменить `DB_DSN` на адрес внешней БД и заполнить секреты T-Invest/Telegram. Workflow при каждом деплое перевыставляет владельцем группу `overnight-bot` и режим `0640`, чтобы env читался службой, но не был world-readable. Если файла нет, workflow падает до перезапуска службы.
-
-Systemd unit (`deploy/systemd/overnight-trading-bot.service`) запускает `/usr/local/bin/overnight-trading-bot` под непривилегированным пользователем `overnight-bot` с базовым systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, пустой `CapabilityBoundingSet` и т.д.). Логи смотрятся через `journalctl -u overnight-trading-bot.service`.
-
 ## Runbook
 
 API недоступен утром:
